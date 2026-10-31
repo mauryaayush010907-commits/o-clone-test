@@ -46,8 +46,14 @@ export class RoomRT {
       reconnection: false,
       timeout: 8000,
     };
-    const socket = url ? io(url, opts) : io(opts);
-    this.socket = socket;
+   const backendUrl =
+  url ||
+  import.meta.env.VITE_SOCKET_URL ||
+  import.meta.env.VITE_BACKEND_URL ||
+  "http://localhost:10000";
+
+const socket = io(backendUrl, opts);
+this.socket = socket;
 
     socket.onAny((ev, data) => {
       if (typeof ev !== "string") return;

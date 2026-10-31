@@ -103,41 +103,104 @@ export function attachSFU({ io, rooms, log, cfg }) {
   }
 
   async function relay(event, socket, roomId, to, payload, ack) {
-    if (typeof roomId !== "string" || !roomId || roomId.length > 64 ||
-      typeof to !== "string" || !to || to === socket.id) {
-      return ack?.({ ok: false, error: "bad-room-or-peer" });
-    }
-    try {
-    if (!await isActiveMember(socket.id, roomId)) {
-      log.debug("private WebRTC signal rejected", {
-        event, roomId, socket: socket.id, to, code: "not-in-room",
-      });
-      return ack?.({ ok: false, error: "not-in-room" });
-    }
-    if (!await isActiveRecipient(to, roomId)) {
-      log.debug("private WebRTC signal rejected", {
-        event, roomId, socket: socket.id, to, code: "peer-not-in-room",
-      });
-      return ack?.({ ok: false, error: "peer-not-in-room" });
-    }
-    if (!await isActiveMember(socket.id, roomId)) {
-      log.debug("private WebRTC signal rejected", {
-        event, roomId, socket: socket.id, to, code: "not-in-room",
-      });
-      return ack?.({ ok: false, error: "not-in-room" });
-    }
-    io.to(to).emit(event, { from: socket.id, roomId, ...payload });
-    ack?.({ ok: true });
-    if (!cfg.isProd) {
-      log.debug("private WebRTC signal forwarded", { event, roomId, socket: socket.id, to });
-    }
-    } catch (error) {
-      log.warn("private WebRTC relay failed", {
-        event, roomId, socket: socket.id, to, err: error.message,
-      });
-      ack?.({ ok: false, error: "internal" });
-    }
+  const invalidRoom =
+    typeof roomId !== "string" ||
+    !roomId ||
+    roomId.length > 64;
+
+  const invalidPeer =
+    typeof to !== "string" ||
+    !to ||
+    to === socket.id;
+
+  if (invalidRoom || invalidPeer) {
+    log.warn("WebRTC relay rejected: invalid room or peer", {
+      event,
+      socketId: socket.id,
+      roomIdType: typeof roomId,
+      roomIdLength:
+        typeof roomId === "string" ? roomId.length : null,
+      targetType: typeof to,
+      targetMissing: !to,
+      selfTarget: to === socket.id,
+      invalidRoom,
+      invalidPeer,
+    });
+
+    return ack?.({
+      ok: false,
+      error: "bad-room-or-peer",
+    });
   }
+
+  try {
+    // Verify sender belongs to the active room.
+    if (!(await isActiveMember(socket.id, roomId))) {
+      log.debug("WebRTC signal rejected", {
+        event,
+        roomId,
+        socketId: socket.id,
+        code: "not-in-room",
+      });
+
+      return ack?.({
+        ok: false,
+        error: "not-in-room",
+      });
+    }
+
+    // Verify the intended recipient belongs to the same room.
+    if (!(await isActiveRecipient(to, roomId))) {
+      log.debug("WebRTC signal rejected", {
+        event,
+        roomId,
+        socketId: socket.id,
+        code: "peer-not-in-room",
+      });
+
+      return ack?.({
+        ok: false,
+        error: "peer-not-in-room",
+      });
+    }
+
+    // Recheck sender membership after asynchronous validation.
+    if (!(await isActiveMember(socket.id, roomId))) {
+      return ack?.({
+        ok: false,
+        error: "not-in-room",
+      });
+    }
+
+    io.to(to).emit(event, {
+      from: socket.id,
+      roomId,
+      ...payload,
+    });
+
+    ack?.({ ok: true });
+
+    if (!cfg.isProd) {
+      log.debug("WebRTC signal forwarded", {
+        event,
+        roomId,
+        socketId: socket.id,
+        to,
+      });
+    }
+  } catch (error) {
+    log.warn("WebRTC relay failed", {
+      event,
+      socketId: socket.id,
+      error: error.message,
+    });
+
+    ack?.({
+      ok: false,
+      error: "internal",
+    });
+  }
+}
 
   // ----- Join a private room (Socket.IO) -----
   // Called from socket.js after the room manager has authorized the socket

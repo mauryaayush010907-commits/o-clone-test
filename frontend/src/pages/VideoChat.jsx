@@ -230,6 +230,16 @@ export default function VideoChat() {
       }
       return false;
     }
+    if (import.meta.env.DEV) {
+      console.debug("WebRTC signaling sent", {
+        event,
+        feature: "random-match",
+        payloadKeys: Object.keys(payload),
+        matchId: payload.matchId,
+        socketId: rt.socket?.id,
+        selectedHandler: "backend socket.js random-match relay",
+      });
+    }
     const result = typeof rt.sendWithAck === "function"
       ? rt.sendWithAck(event, payload)
       : rt.send(event, payload);
@@ -587,6 +597,16 @@ export default function VideoChat() {
     (ev, d = {}) => {
       const f = H.current;
       const s = S.current;
+      if (import.meta.env.DEV && ev.startsWith("webrtc:")) {
+        console.debug("WebRTC signaling handler selected", {
+          event: ev,
+          feature: "random-match",
+          payloadKeys: Object.keys(d),
+          matchId: d.matchId,
+          socketId: rtRef.current?.socket?.id,
+          selectedHandler: "VideoChat.handleEvent",
+        });
+      }
       switch (ev) {
         case "match:queued":
           if (d.generation && d.generation !== s.findGeneration) break;

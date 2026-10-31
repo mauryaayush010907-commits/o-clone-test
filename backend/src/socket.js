@@ -69,9 +69,23 @@ export function attachSockets(io, { matchmaker, moderation, store, cfg, log, roo
     const wrap = (event, handler) => {
       socket.on(event, (data, ack) => {
         const eventData = data && typeof data === "object" ? data : {};
-        if (event.startsWith("webrtc:") &&
-          Object.prototype.hasOwnProperty.call(eventData, "roomId")) {
-          return; // Private-room signaling is handled by the room-authorized relay.
+        if (event.startsWith("webrtc:")) {
+          const isPrivateRoomSignal =
+            Object.prototype.hasOwnProperty.call(eventData, "roomId");
+          if (!cfg.isProd) {
+            log.debug("WebRTC signaling handler selected", {
+              event,
+              feature: isPrivateRoomSignal ? "private-room" : "random-match",
+              payloadKeys: Object.keys(eventData),
+              matchId: eventData.matchId,
+              roomId: eventData.roomId,
+              socketId: socket.id,
+              selectedHandler: isPrivateRoomSignal
+                ? "sfu.js private-room relay"
+                : "socket.js random-match relay",
+            });
+          }
+          if (isPrivateRoomSignal) return;
         }
         const process = async () => {
         // Always ack (success or failure) so client emitters never hang.

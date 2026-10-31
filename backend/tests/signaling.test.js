@@ -14,6 +14,8 @@ import { MemoryStore } from "../src/store.js";
 import { createModeration } from "../src/moderation.js";
 import { createMatchmaker } from "../src/matchmaker.js";
 import { attachSockets } from "../src/socket.js";
+import { createRoomManager } from "../src/rooms.js";
+import { attachSFU } from "../src/sfu.js";
 import { createApp } from "../src/app.js";
 import { buildIceServers } from "../src/routes.js";
 
@@ -27,7 +29,7 @@ const cfg = loadConfig({
   HASH_SALT: "test-salt",
 });
 
-let app, server, io, base, store, moderation, matchmaker;
+let app, server, io, base, store, moderation, matchmaker, rooms, sfu;
 
 const connectClient = () =>
   new Promise((resolve, reject) => {
@@ -61,8 +63,11 @@ beforeAll(async () => {
   app = createApp({ cfg, store, moderation, log });
   server = http.createServer(app);
   io = new SocketIOServer(server, { cors: { origin: "http://localhost:5173", credentials: true } });
+  rooms = createRoomManager({ store, io, log, cfg });
+  cfg.storeRef = () => store;
+  sfu = attachSFU({ io, rooms, log, cfg });
   matchmaker = createMatchmaker({ store, io, log, cfg });
-  attachSockets(io, { matchmaker, moderation, store, cfg, log });
+  attachSockets(io, { matchmaker, moderation, store, cfg, log, rooms, sfu });
   await new Promise((res) => server.listen(0, "127.0.0.1", res));
   base = `http://127.0.0.1:${server.address().port}`;
 });
@@ -227,24 +232,46 @@ describe("real-time signaling over real sockets", () => {
     expect(wrongOffer).toMatchObject({ ok: false, code: "bad-signaling-role" });
 
     // offer: a -> b
+    const offers = [];
+    b.on("webrtc:offer", (event) => offers.push(event));
     const gotOffer = waitFor(b, "webrtc:offer");
-    await emit(a, "webrtc:offer", { matchId: aFound.matchId, sdp: "v=0\nfake-sdp-offer" });
+    const offerAck = await emit(a, "webrtc:offer", { matchId: aFound.matchId, sdp: "v=0\nfake-sdp-offer" });
+    expect(offerAck).toMatchObject({ ok: true });
     const offer = await gotOffer;
-    expect(offer.sdp).toBe("v=0\nfake-sdp-offer");
+    expect(offer).toMatchObject({
+      matchId: aFound.matchId,
+      sdp: "v=0\nfake-sdp-offer",
+      attempt: 0,
+      retry: false,
+    });
 
     // answer: b -> a
+    const answers = [];
+    a.on("webrtc:answer", (event) => answers.push(event));
     const gotAnswer = waitFor(a, "webrtc:answer");
-    await emit(b, "webrtc:answer", { matchId: aFound.matchId, sdp: "v=0\nfake-sdp-answer" });
-    expect((await gotAnswer).sdp).toBe("v=0\nfake-sdp-answer");
+    const answerAck = await emit(b, "webrtc:answer", { matchId: aFound.matchId, sdp: "v=0\nfake-sdp-answer" });
+    expect(answerAck).toMatchObject({ ok: true });
+    expect(await gotAnswer).toMatchObject({
+      matchId: aFound.matchId,
+      sdp: "v=0\nfake-sdp-answer",
+      attempt: 0,
+    });
 
     const wrongAnswer = await emit(a, "webrtc:answer", { matchId: aFound.matchId, sdp: "v=0\nwrong-role" });
     expect(wrongAnswer).toMatchObject({ ok: false, code: "bad-signaling-role" });
 
     // ice: a -> b
     const cand = { candidate: "candidate:1 1 udp 2122260223 10.0.0.1 54321 typ host", sdpMid: "0" };
+    const iceCandidates = [];
+    b.on("webrtc:ice-candidate", (event) => iceCandidates.push(event));
     const gotIce = waitFor(b, "webrtc:ice-candidate");
-    await emit(a, "webrtc:ice-candidate", { matchId: aFound.matchId, candidate: cand });
+    const iceAck = await emit(a, "webrtc:ice-candidate", { matchId: aFound.matchId, candidate: cand });
+    expect(iceAck).toMatchObject({ ok: true });
     expect(await gotIce).toMatchObject({ candidate: cand, attempt: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(offers).toHaveLength(1);
+    expect(answers).toHaveLength(1);
+    expect(iceCandidates).toHaveLength(1);
 
     // chat: b -> a
     const gotMsg = waitFor(a, "chat:message");

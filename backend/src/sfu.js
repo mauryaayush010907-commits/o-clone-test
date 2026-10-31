@@ -254,19 +254,94 @@ export function attachSFU({ io, rooms, log, cfg }) {
     });
 
     // ----- Signaling relay (mesh) -----
-    socket.on("webrtc:offer", async ({ to, sdp, roomId } = {}, ack) => {
+    socket.on("webrtc:offer", async (data = {}, ack) => {
+      const signal = data && typeof data === "object" ? data : {};
+      if (!Object.prototype.hasOwnProperty.call(signal, "roomId")) {
+        if (!cfg.isProd) {
+          log.debug("WebRTC signaling handler skipped", {
+            event: "webrtc:offer",
+            feature: typeof signal.matchId === "string" ? "random-match" : "unclassified",
+            payloadKeys: Object.keys(signal),
+            matchId: signal.matchId,
+            socketId: socket.id,
+            selectedHandler: "socket.js random-match dispatcher",
+          });
+        }
+        return;
+      }
+      const { to, sdp, roomId } = signal;
+      if (!cfg.isProd) {
+        log.debug("WebRTC signaling handler selected", {
+          event: "webrtc:offer",
+          feature: "private-room",
+          payloadKeys: Object.keys(signal),
+          roomId,
+          socketId: socket.id,
+          selectedHandler: "sfu.js private-room relay",
+        });
+      }
       if (typeof sdp !== "string" || sdp.length === 0 || sdp.length > SDP_MAX) {
         return ack?.({ ok: false, error: "bad-sdp" });
       }
       await relay("webrtc:offer", socket, roomId, to, { sdp }, ack);
     });
-    socket.on("webrtc:answer", async ({ to, sdp, roomId } = {}, ack) => {
+    socket.on("webrtc:answer", async (data = {}, ack) => {
+      const signal = data && typeof data === "object" ? data : {};
+      if (!Object.prototype.hasOwnProperty.call(signal, "roomId")) {
+        if (!cfg.isProd) {
+          log.debug("WebRTC signaling handler skipped", {
+            event: "webrtc:answer",
+            feature: typeof signal.matchId === "string" ? "random-match" : "unclassified",
+            payloadKeys: Object.keys(signal),
+            matchId: signal.matchId,
+            socketId: socket.id,
+            selectedHandler: "socket.js random-match dispatcher",
+          });
+        }
+        return;
+      }
+      const { to, sdp, roomId } = signal;
+      if (!cfg.isProd) {
+        log.debug("WebRTC signaling handler selected", {
+          event: "webrtc:answer",
+          feature: "private-room",
+          payloadKeys: Object.keys(signal),
+          roomId,
+          socketId: socket.id,
+          selectedHandler: "sfu.js private-room relay",
+        });
+      }
       if (typeof sdp !== "string" || sdp.length === 0 || sdp.length > SDP_MAX) {
         return ack?.({ ok: false, error: "bad-sdp" });
       }
       await relay("webrtc:answer", socket, roomId, to, { sdp }, ack);
     });
-    socket.on("webrtc:ice", async ({ to, candidate, roomId } = {}, ack) => {
+    socket.on("webrtc:ice", async (data = {}, ack) => {
+      const signal = data && typeof data === "object" ? data : {};
+      if (!Object.prototype.hasOwnProperty.call(signal, "roomId")) {
+        if (!cfg.isProd) {
+          log.debug("WebRTC signaling handler selected", {
+            event: "webrtc:ice",
+            feature: "private-room",
+            payloadKeys: Object.keys(signal),
+            matchId: signal.matchId,
+            socketId: socket.id,
+            selectedHandler: "sfu.js private-room relay (validation)",
+          });
+        }
+        return relay("webrtc:ice", socket, signal.roomId, signal.to, { candidate: signal.candidate }, ack);
+      }
+      const { to, candidate, roomId } = signal;
+      if (!cfg.isProd) {
+        log.debug("WebRTC signaling handler selected", {
+          event: "webrtc:ice",
+          feature: "private-room",
+          payloadKeys: Object.keys(signal),
+          roomId,
+          socketId: socket.id,
+          selectedHandler: "sfu.js private-room relay",
+        });
+      }
       if (!candidate || typeof candidate !== "object" || JSON.stringify(candidate).length > ICE_MAX) {
         return ack?.({ ok: false, error: "bad-ice" });
       }

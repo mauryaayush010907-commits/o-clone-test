@@ -278,21 +278,43 @@ export default function PrivateChat() {
       }
       case "webrtc:offer": {
         if (import.meta.env.DEV) {
-          console.debug("Private-room offer received", {
-            matchId: d.roomId,
+          console.debug("Private-room signaling handler selected", {
+            event: "webrtc:offer",
+            feature: "private-room",
+            payloadKeys: Object.keys(d),
             roomId: d.roomId,
             socketId: rtRef.current?.socket?.id,
-            from: d.from,
+            selectedHandler: "PrivateChat.handleEvent",
           });
         }
         handleRemoteOffer(d, d.from, d.sdp);
         break;
       }
       case "webrtc:answer": {
+        if (import.meta.env.DEV) {
+          console.debug("Private-room signaling handler selected", {
+            event: "webrtc:answer",
+            feature: "private-room",
+            payloadKeys: Object.keys(d),
+            roomId: d.roomId,
+            socketId: rtRef.current?.socket?.id,
+            selectedHandler: "PrivateChat.handleEvent",
+          });
+        }
         handleRemoteAnswer(d, d.from, d.sdp);
         break;
       }
       case "webrtc:ice": {
+        if (import.meta.env.DEV) {
+          console.debug("Private-room signaling handler selected", {
+            event: "webrtc:ice",
+            feature: "private-room",
+            payloadKeys: Object.keys(d),
+            roomId: d.roomId,
+            socketId: rtRef.current?.socket?.id,
+            selectedHandler: "PrivateChat.handleEvent",
+          });
+        }
         handleRemoteIce(d, d.from, d.candidate);
         break;
       }
@@ -473,7 +495,6 @@ export default function PrivateChat() {
       if (!isCurrentPeer(from, entry, generation, activeRoomId)) return;
       if (import.meta.env.DEV) {
         console.debug("Private-room answer generated", {
-          matchId: activeRoomId,
           roomId: activeRoomId,
           socketId: rtRef.current?.socket?.id,
           to: from,
@@ -549,10 +570,20 @@ export default function PrivateChat() {
       console.warn(`Cannot send ${event}: private room connection is not ready`);
       return false;
     }
-    socket.emit(event, { ...payload, roomId: activeRoomId }, (ack) => {
+    const signal = { ...payload, roomId: activeRoomId };
+    if (import.meta.env.DEV) {
+      console.debug("Private-room signaling sent", {
+        event,
+        feature: "private-room",
+        payloadKeys: Object.keys(signal),
+        roomId: activeRoomId,
+        socketId: socket.id,
+        selectedHandler: "backend sfu.js private-room relay",
+      });
+    }
+    socket.emit(event, signal, (ack) => {
       if (!ack?.ok) {
         console.warn(`Private-room ${event} rejected`, {
-          matchId: activeRoomId,
           roomId: activeRoomId,
           socketId: socket.id,
           code: ack?.error || "unknown-error",

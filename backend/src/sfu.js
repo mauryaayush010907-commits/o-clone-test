@@ -355,6 +355,7 @@ export function attachSFU({ io, rooms, log, cfg }) {
       if (!t || t.length > 500) return ack?.({ ok: false, error: "bad-message" });
       const username = socket.data?.username || "anon";
       io.to(roomName(roomId)).emit("room:chat", {
+        roomId,
         from: socket.id,
         username,
         text: t,

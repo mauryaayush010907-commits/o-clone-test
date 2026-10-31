@@ -105,6 +105,24 @@ describe("HTTP API", () => {
     expect(res.body.turnConfigured).toBe(false);
   });
 
+  it("serves configured TURN URLs and credentials to the WebRTC client", async () => {
+    const turnCfg = loadConfig({
+      NODE_ENV: "test",
+      TURN_URLS: "turn:relay.example:80,turn:relay.example:80?transport=tcp",
+      TURN_USERNAME: "test-user",
+      TURN_PASSWORD: "test-credential",
+    });
+    const turnApp = createApp({ cfg: turnCfg, store, moderation, log });
+    const res = await request(turnApp).get("/api/ice-servers");
+    expect(res.status).toBe(200);
+    expect(res.body.turnConfigured).toBe(true);
+    expect(res.body.iceServers[1]).toEqual({
+      urls: ["turn:relay.example:80", "turn:relay.example:80?transport=tcp"],
+      username: "test-user",
+      credential: "test-credential",
+    });
+  });
+
   it("builds authenticated TURN entries from explicit provider URLs", () => {
     const turnCfg = loadConfig({
       NODE_ENV: "test",

@@ -1,5 +1,9 @@
 import { defineConfig } from "@playwright/test";
 
+const host = "localhost";
+const port = Number(process.env.E2E_PORT || 5173);
+const baseURL = process.env.E2E_BASE_URL || `http://${host}:${port}`;
+
 /**
  * E2E tests run against the FULL local stack:
  *   1. docker compose up -d            (redis + mongo)
@@ -17,7 +21,7 @@ export default defineConfig({
   timeout: 30000,
   retries: 0,
   use: {
-    baseURL: process.env.E2E_BASE_URL || "http://localhost:5173", 
+    baseURL,
     video: "off",
   },
   projects: [
@@ -33,9 +37,9 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: "npm run dev",
-      url: "http://localhost:5173",
-      reuseExistingServer: true,
+      command: `npm run dev -- --host ${host} --port ${port} --strictPort`,
+      url: baseURL,
+      reuseExistingServer: false,
       timeout: 30000,
     },
   ],

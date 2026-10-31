@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { SocketRT, fmtClock, getIceServers } from "../lib/rt.js";
 import { loadPrefs, savePrefs, activeCount, toFindPayload } from "../lib/prefs.js";
 import FilterModal from "../components/FilterModal.jsx";
-import { getMedia, makePeerConnection, createOffer, createAnswer, listCameras, switchCamera, mediaError } from "../lib/webrtc.js";
+import { getMedia, makePeerConnection, selectedCandidatePairTypes, listCameras, switchCamera, mediaError } from "../lib/webrtc.js";
 import {
   Logo,
   Btn,
@@ -42,6 +42,7 @@ export default function VideoChat() {
   const [rtStatus, setRtStatus] = useState("connecting");
   const [phase, setPhaseState] = useState("idle"); // idle|starting|queued|connecting|live|ended|error
   const [endReason, setEndReason] = useState("");
+  const [connectionFailure, setConnectionFailure] = useState("");
   const [errorInfo, setErrorInfo] = useState(null);
   const [messages, setMessages] = useState([]);
   const [typing, setTyping] = useState(false);
@@ -77,6 +78,7 @@ export default function VideoChat() {
     matchId: null,
     role: null,
     retry: 0,
+    connectedOnce: false,
     ice: null,
     generation: 0,
     findGeneration: null,
@@ -212,6 +214,41 @@ export default function VideoChat() {
     toastTimerRef.current = setTimeout(() => setToast(""), ms);
   };
 
+  const logWebRtc = (level, event, pc, matchId = S.current.matchId, attempt = S.current.retry, extra = {}) => {
+    if (level === "debug" && !import.meta.env.DEV) return;
+    const snapshot = {
+      event,
+      feature: "random-match",
+      matchId,
+      attempt,
+      socketStatus: rtRef.current?.status || "unavailable",
+      socketConnected: !!rtRef.current?.socket?.connected,
+      socketId: rtRef.current?.socket?.id || null,
+      signalingState: pc?.signalingState || null,
+      iceGatheringState: pc?.iceGatheringState || null,
+      iceConnectionState: pc?.iceConnectionState || null,
+      connectionState: pc?.connectionState || null,
+      queuedIceCandidates: pendingIceRef.current.filter((entry) =>
+        entry.matchId === matchId && entry.attempt === attempt
+      ).length,
+      ...extra,
+    };
+    console[level]("WebRTC diagnostic", snapshot);
+  };
+
+  const logSelectedPair = async (pc, matchId, attempt) => {
+    try {
+      const pair = await selectedCandidatePairTypes(pc);
+      logWebRtc("info", "selected-candidate-pair", pc, matchId, attempt, {
+        candidatePair: pair || "unavailable",
+      });
+    } catch (error) {
+      logWebRtc("warn", "candidate-pair-stats-failed", pc, matchId, attempt, {
+        errorName: error?.name || "Error",
+      });
+    }
+  };
+
   const isCurrentSession = (matchId, generation, pc = null) => {
     const rt = rtRef.current;
     return !!matchId && S.current.matchId === matchId &&
@@ -240,10 +277,18 @@ export default function VideoChat() {
         selectedHandler: "backend socket.js random-match relay",
       });
     }
+    const signalEvent = event === "webrtc:offer" || event === "webrtc:answer";
+    if (!import.meta.env.DEV && signalEvent) {
+      logWebRtc("info", "signal-sent", pc, payload.matchId, payload.attempt, {
+        event,
+        payloadKeys: Object.keys(payload),
+      });
+    }
     const result = typeof rt.sendWithAck === "function"
       ? rt.sendWithAck(event, payload)
       : rt.send(event, payload);
     Promise.resolve(result).then((response) => {
+      if (!isCurrentSession(payload.matchId, generation, pc)) return;
       if (response?.ok === false) {
         const details = {
           event,
@@ -252,13 +297,23 @@ export default function VideoChat() {
           socketId: rt.socket?.id,
           code: response.code || response.error,
         };
+        logWebRtc("warn", "signal-rejected", pc, payload.matchId, payload.attempt, {
+          event,
+          code: details.code,
+        });
         if (event === "webrtc:answer") console.warn("WebRTC answer rejected", details);
         else console.warn("WebRTC signal was rejected", details);
+        if (signalEvent) endFailedConnection(`Signaling rejected: ${details.code || "unknown error"}`);
+      } else if (signalEvent) {
+        logWebRtc(import.meta.env.DEV ? "debug" : "info", "signal-acknowledged", pc,
+          payload.matchId, payload.attempt, { event, acknowledged: true });
       }
     }).catch((error) => {
+      if (!isCurrentSession(payload.matchId, generation, pc)) return;
       console.warn("WebRTC signal could not be sent", {
-        event, matchId: payload.matchId, generation, error,
+        event, matchId: payload.matchId, generation, errorName: error?.name || "Error",
       });
+      if (signalEvent) endFailedConnection(`Signaling acknowledgement failed: ${error?.message || "timeout"}`);
     });
     return true;
   };
@@ -295,6 +350,7 @@ export default function VideoChat() {
     s.matchId = null;
     s.role = null;
     s.retry = 0;
+    s.connectedOnce = false;
     offerInFlightRef.current = null;
     remoteOfferInFlightRef.current = null;
     iceFlushRef.current = false;
@@ -328,11 +384,14 @@ export default function VideoChat() {
         try {
           await pc.addIceCandidate(entry.candidate);
           if (generation !== S.current.generation || pc !== pcRef.current) return;
+          logWebRtc("debug", "queued-ice-applied", pc, entry.matchId, entry.attempt, {
+            remainingQueuedIceCandidates: pendingIceRef.current.filter((candidate) =>
+              candidate.matchId === entry.matchId && candidate.attempt === entry.attempt
+            ).length,
+          });
         } catch (error) {
-          console.warn("Could not add queued video-chat ICE candidate", {
-            matchId: S.current.matchId,
-            attempt: entry.attempt,
-            error,
+          logWebRtc("warn", "add-ice-candidate-failed", pc, entry.matchId, entry.attempt, {
+            errorName: error?.name || "Error",
           });
         }
       }
@@ -378,20 +437,40 @@ export default function VideoChat() {
           });
         }
       },
-      onState: (st) => onPcState(st, pc, generation),
-      onGathering: () => {},
+      onState: (state) => {
+        logWebRtc(state === "failed" ? "warn" : "info", "peer-connection-state", pc, matchId, attempt, {
+          state,
+        });
+        if (state === "connected" || state === "failed") {
+          void logSelectedPair(pc, matchId, attempt);
+        }
+        onPcState(state, pc, generation);
+      },
+      onIceState: (state) => logWebRtc(state === "failed" ? "warn" : "debug",
+        "ice-connection-state", pc, matchId, attempt, { state }),
+      onIceError: (error) => logWebRtc("warn", "ice-server-error", pc, matchId, attempt, error),
+      onSignaling: (state) => logWebRtc("debug", "signaling-state", pc, matchId, attempt, { state }),
+      onGathering: (state) => logWebRtc(state === "complete" ? "info" : "debug",
+        "ice-gathering-state", pc, matchId, attempt, { state }),
     });
     pcRef.current = pc;
     const stream = localStreamRef.current;
     if (stream) stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-    armConnectionTimer(pc, S.current.role === "offerer" ? 20000 : 35000);
+    armConnectionTimer(pc, S.current.role === "offerer" ? 20000 : 30000, undefined, "establishment-timeout");
   };
 
-  const armConnectionTimer = (pc, delay, onTimeout = () => onPcState("failed", pc)) => {
+  const armConnectionTimer = (pc, delay, onTimeout, reason = "connection-timeout") => {
+    const generation = S.current.generation;
+    const timeoutHandler = onTimeout || (() => onPcState("failed", pc, generation));
     if (connectionTimerRef.current) clearTimeout(connectionTimerRef.current);
     connectionTimerRef.current = setTimeout(() => {
       connectionTimerRef.current = null;
-      if (pcRef.current === pc && S.current.phase === "connecting") onTimeout();
+      if (pcRef.current === pc && S.current.generation === generation &&
+        ["connecting", "live"].includes(S.current.phase)) {
+        logWebRtc("warn", "connection-timeout", pc, S.current.matchId, S.current.retry, { reason });
+        void logSelectedPair(pc, S.current.matchId, S.current.retry);
+        timeoutHandler(reason);
+      }
     }, delay);
   };
 
@@ -401,9 +480,16 @@ export default function VideoChat() {
     if (pc.signalingState !== "stable") return;
     if (offerInFlightRef.current?.pc === pc) return offerInFlightRef.current.promise;
     const attempt = S.current.retry;
+    let stage = "createOffer";
     const operation = (async () => {
-      const sdp = await createOffer(pc);
+      const offer = await pc.createOffer();
       if (!isCurrentSession(matchId, generation, pc) || attempt !== S.current.retry) return;
+      stage = "setLocalDescription";
+      await pc.setLocalDescription(offer);
+      if (!isCurrentSession(matchId, generation, pc) || attempt !== S.current.retry) return;
+      const sdp = pc.localDescription;
+      if (!sdp?.sdp) throw new Error("Local offer description is empty.");
+      logWebRtc("debug", "local-offer-created", pc, matchId, attempt);
       sendWebRtcSignal("webrtc:offer", {
         matchId,
         sdp: sdp.sdp,
@@ -415,8 +501,14 @@ export default function VideoChat() {
     offerInFlightRef.current = inFlight;
     try {
       await operation;
-    } catch (e) {
-      console.warn("createOffer failed", e);
+    } catch (error) {
+      logWebRtc("warn", "offer-creation-failed", pc, matchId, attempt, {
+        stage,
+        errorName: error?.name || "Error",
+      });
+      if (isCurrentSession(matchId, generation, pc)) {
+        endFailedConnection("Could not create or set the local offer.");
+      }
     } finally {
       if (offerInFlightRef.current === inFlight) offerInFlightRef.current = null;
     }
@@ -431,6 +523,7 @@ export default function VideoChat() {
     s.matchId = matchId;
     s.role = role;
     s.retry = 0;
+    s.connectedOnce = false;
     if (import.meta.env.DEV) {
       console.debug("Match session started", {
         matchId,
@@ -457,13 +550,6 @@ export default function VideoChat() {
       console.warn("Ignoring offer from the wrong signaling role", { matchId: d.matchId });
       return;
     }
-    if (import.meta.env.DEV) {
-      console.debug("WebRTC offer received", {
-        matchId: d.matchId,
-        generation: s.generation,
-        socketId: rtRef.current?.socket?.id,
-      });
-    }
     const attempt = d.attempt === undefined
       ? d.retry ? Math.min(s.retry + 1, 2) : 0
       : d.attempt;
@@ -472,6 +558,8 @@ export default function VideoChat() {
       return;
     }
     if (attempt < s.retry || attempt > 2) return;
+    logWebRtc(import.meta.env.DEV ? "debug" : "info", "offer-received", pcRef.current,
+      d.matchId, attempt, { retry: d.retry === true });
     if (attempt > s.retry) {
       s.retry = attempt;
       buildPc(d.matchId, attempt, generation);
@@ -484,24 +572,32 @@ export default function VideoChat() {
     }
     if (remoteOfferInFlightRef.current === pc) return;
     remoteOfferInFlightRef.current = pc;
+    let stage = "setRemoteDescription";
     try {
       await pc.setRemoteDescription({ type: "offer", sdp: d.sdp });
       if (!isCurrentSession(d.matchId, generation, pc) || attempt !== S.current.retry) return;
+      stage = "flushIce";
       await flushIce(generation);
       if (!isCurrentSession(d.matchId, generation, pc) || attempt !== S.current.retry) return;
-      const ans = await createAnswer(pc);
+      stage = "createAnswer";
+      const answer = await pc.createAnswer();
+      if (!isCurrentSession(d.matchId, generation, pc) || attempt !== S.current.retry) return;
+      stage = "setLocalDescription";
+      await pc.setLocalDescription(answer);
       if (isCurrentSession(d.matchId, generation, pc) && attempt === S.current.retry) {
-        if (import.meta.env.DEV) {
-          console.debug("WebRTC answer generated", {
-            matchId: d.matchId,
-            generation,
-            socketId: rtRef.current?.socket?.id,
-          });
-        }
-        sendWebRtcSignal("webrtc:answer", { matchId: d.matchId, sdp: ans.sdp, attempt }, generation, pc);
+        const sdp = pc.localDescription?.sdp;
+        if (!sdp) throw new Error("Local answer description is empty.");
+        logWebRtc("info", "local-answer-created", pc, d.matchId, attempt);
+        sendWebRtcSignal("webrtc:answer", { matchId: d.matchId, sdp, attempt }, generation, pc);
       }
-    } catch (e) {
-      console.warn("offer handling failed", e);
+    } catch (error) {
+      logWebRtc("warn", "offer-processing-failed", pc, d.matchId, attempt, {
+        stage,
+        errorName: error?.name || "Error",
+      });
+      if (isCurrentSession(d.matchId, generation, pc)) {
+        endFailedConnection(`Could not process the remote offer (${stage}).`);
+      }
     } finally {
       if (remoteOfferInFlightRef.current === pc) remoteOfferInFlightRef.current = null;
     }
@@ -523,6 +619,8 @@ export default function VideoChat() {
     if (attempt !== s.retry) return;
     const pc = pcRef.current;
     if (!pc) return;
+    logWebRtc(import.meta.env.DEV ? "debug" : "info", "answer-received", pc,
+      d.matchId, attempt);
     if (pc.signalingState !== "have-local-offer") {
       console.warn("Ignoring answer with unexpected signaling state", {
         matchId: d.matchId,
@@ -530,12 +628,20 @@ export default function VideoChat() {
       });
       return;
     }
+    let stage = "setRemoteDescription";
     try {
       await pc.setRemoteDescription({ type: "answer", sdp: d.sdp });
       if (!isCurrentSession(d.matchId, generation, pc)) return;
+      stage = "flushIce";
       await flushIce(generation);
-    } catch (e) {
-      console.warn("answer handling failed", e);
+    } catch (error) {
+      logWebRtc("warn", "answer-processing-failed", pc, d.matchId, attempt, {
+        stage,
+        errorName: error?.name || "Error",
+      });
+      if (isCurrentSession(d.matchId, generation, pc)) {
+        endFailedConnection(`Could not process the remote answer (${stage}).`);
+      }
     }
   };
 
@@ -550,6 +656,7 @@ export default function VideoChat() {
     }
     if (attempt < s.retry || attempt > 2) return;
     pendingIceRef.current.push({ candidate: d.candidate, attempt, matchId: d.matchId });
+    logWebRtc("debug", "remote-ice-queued", pcRef.current, d.matchId, attempt);
     flushIce(s.generation);
   };
 
@@ -557,36 +664,61 @@ export default function VideoChat() {
     const s = S.current;
     if (pc !== pcRef.current || generation !== s.generation || !s.matchId) return;
     if (st === "connected" || st === "completed") {
+      s.connectedOnce = true;
       if (connectionTimerRef.current) clearTimeout(connectionTimerRef.current);
       connectionTimerRef.current = null;
+      setConnectionFailure("");
       setP("live");
     } else if (st === "disconnected") {
-      setP("connecting");
-      armConnectionTimer(pc, 10000);
+      if (!s.connectedOnce) setP("connecting");
+      logWebRtc("warn", "temporary-disconnection", pc, s.matchId, s.retry, {
+        establishedBefore: s.connectedOnce,
+      });
+      armConnectionTimer(pc, 10000, undefined, "temporary-disconnection-timeout");
     } else if (st === "failed") {
       if (connectionTimerRef.current) clearTimeout(connectionTimerRef.current);
       connectionTimerRef.current = null;
       if (s.role === "offerer" && s.retry < 2) {
+        const failedAttempt = s.retry;
         s.retry += 1;
+        logWebRtc("warn", "negotiation-retry", pc, s.matchId, failedAttempt, {
+          reason: pc.iceConnectionState === "failed" ? "ice-failed" : "peer-connection-failed",
+          nextAttempt: s.retry,
+        });
         buildPc(s.matchId, s.retry, generation);
         setMessages((m) => [...m, { system: true, text: "Network hiccup — retrying connection…" }]);
         setP("connecting");
         doOffer(s.matchId, generation);
       } else if (s.role === "answerer" && s.retry < 2) {
-        armConnectionTimer(pc, 25000, endFailedConnection);
+        setP("connecting");
+        logWebRtc("warn", "awaiting-retry-offer", pc, s.matchId, s.retry, {
+          reason: pc.iceConnectionState === "failed" ? "ice-failed" : "peer-connection-failed",
+        });
+        armConnectionTimer(pc, 15000,
+          () => endFailedConnection("The retry offer did not arrive before the recovery timeout."),
+          "retry-offer-timeout");
       } else {
-        endFailedConnection();
+        endFailedConnection("ICE connectivity failed after all negotiation attempts.");
       }
     }
   };
 
-  const endFailedConnection = () => {
+  const endFailedConnection = (reason = "Connection establishment timed out.") => {
+    const matchId = S.current.matchId;
+    const socket = rtRef.current?.socket;
+    if (matchId && socket?.connected) {
+      void rtRef.current.sendWithAck("match:stop", { matchId }).catch(() => {});
+    }
+    logWebRtc("warn", "connection-failed", pcRef.current, matchId, S.current.retry, {
+      reason,
+    });
     teardown(false);
+    setConnectionFailure(reason);
     setEndReason("failed");
     setP("ended");
     setMessages((m) => [...m, {
       system: true,
-      text: "Peer-to-peer connection failed. Check TURN service availability and credentials, and confirm your network permits the configured TURN transports.",
+      text: reason,
     }]);
   };
 
@@ -605,6 +737,19 @@ export default function VideoChat() {
           matchId: d.matchId,
           socketId: rtRef.current?.socket?.id,
           selectedHandler: "VideoChat.handleEvent",
+        });
+      } else if (!import.meta.env.DEV &&
+        (ev === "webrtc:offer" || ev === "webrtc:answer")) {
+        console.info("WebRTC signaling received", {
+          event: ev,
+          feature: "random-match",
+          matchId: d.matchId,
+          attempt: d.attempt,
+          socketConnected: !!rtRef.current?.socket?.connected,
+          socketId: rtRef.current?.socket?.id || null,
+          signalingState: pcRef.current?.signalingState || null,
+          iceConnectionState: pcRef.current?.iceConnectionState || null,
+          connectionState: pcRef.current?.connectionState || null,
         });
       }
       switch (ev) {
@@ -631,6 +776,7 @@ export default function VideoChat() {
         case "match:ended":
           if (d.matchId && d.matchId === s.matchId) {
             f.teardown(false);
+            setConnectionFailure("");
             setMessages((m) => [...m, { system: true, text: END_LABELS[d.reason] || "Conversation ended" }]);
             setEndReason(d.reason);
             setP("ended");
@@ -749,10 +895,33 @@ export default function VideoChat() {
     setP("starting");
     setErrorInfo(null);
     setEndReason("");
+    setConnectionFailure("");
     try {
       const ice = await getIceServers();
       if (generation !== s.generation || s.phase !== "starting") return;
       s.ice = ice;
+      const turnServers = ice.filter((server) =>
+        (Array.isArray(server.urls) ? server.urls : [server.urls])
+          .some((url) => typeof url === "string" && /^turns?:/i.test(url))
+      );
+      const turnTransports = [...new Set(turnServers.flatMap((server) =>
+        (Array.isArray(server.urls) ? server.urls : [server.urls])
+          .filter((url) => typeof url === "string" && /^turns?:/i.test(url))
+        .map((url) => /[?&]transport=tcp(?:&|$)/i.test(url) ? "tcp" : "unspecified")
+      ))];
+      console.info("WebRTC ICE configuration loaded", {
+        matchId: null,
+        stunServerCount: ice.filter((server) =>
+          (Array.isArray(server.urls) ? server.urls : [server.urls])
+            .some((url) => typeof url === "string" && /^stun:/i.test(url))
+        ).length,
+        turnServerCount: turnServers.length,
+        turnTransports,
+        turnCredentialsPresent: turnServers.length > 0 && turnServers.every((server) =>
+          typeof server.username === "string" && !!server.username &&
+          typeof server.credential === "string" && !!server.credential
+        ),
+      });
     } catch (error) {
       if (generation !== s.generation || s.phase !== "starting") return;
       setErrorInfo({
@@ -789,6 +958,7 @@ export default function VideoChat() {
     } catch (err) {
       if (generation !== s.generation || s.phase !== "starting") return;
       setErrorInfo(mediaError(err));
+      setConnectionFailure("");
       setP("error");
       return;
     }
@@ -834,6 +1004,7 @@ export default function VideoChat() {
       }
       setMessages([]);
       setEndReason("");
+      setConnectionFailure("");
       setNeedTapAudio(false);
       queueWithPrefs(prefs);
     } finally {
@@ -1029,7 +1200,7 @@ export default function VideoChat() {
               <div className="absolute inset-0 grid place-items-center bg-ink/70">
                 <div className="flex items-center gap-3 rounded-2xl border border-line bg-panel/90 px-5 py-3 text-sm text-mute">
                   <Loader2 size={16} className="anim-spin-slow text-aqua" />
-                  Establishing secure peer-to-peer connection…
+                  {S.current.connectedOnce ? "Re-establishing peer-to-peer connection…" : "Establishing secure peer-to-peer connection…"}
                 </div>
               </div>
             )}
@@ -1043,9 +1214,15 @@ export default function VideoChat() {
                   <h3 className="font-display text-xl font-semibold">{END_LABELS[endReason] || "Conversation ended"}</h3>
                   {endReason === "failed" && (
                     <p className="mt-2 text-sm text-mute">
-                      {S.current.ice?.some((server) => (Array.isArray(server.urls) ? server.urls : [server.urls]).some((url) => /^turns?:/i.test(url)))
-                        ? "Direct peer-to-peer traffic may be blocked on one network. Try again or check your connection."
-                        : "Direct peer-to-peer traffic may be blocked on one network. This server has no TURN relay configured; configure TURN_URL and credentials on the backend, then try again."}
+                      {connectionFailure && <span className="block">{connectionFailure}</span>}
+                      <span className="mt-1 block">
+                        {S.current.ice?.some((server) =>
+                          (Array.isArray(server.urls) ? server.urls : [server.urls])
+                            .some((url) => typeof url === "string" && /^turns?:/i.test(url))
+                        )
+                          ? "Check the configured TURN relay’s reachability and provider credentials."
+                          : "No TURN relay was advertised. Configure provider-supported TURN URLs and credentials on the backend."}
+                      </span>
                     </p>
                   )}
                   <div className="mt-5 flex justify-center gap-3">

@@ -252,7 +252,7 @@ test.describe("Drift E2E", () => {
     await page.getByRole("button", { name: /Start video chat/i }).click();
     // fake media devices are enabled in the launch args
     await expect(page.getByText(/Looking for someone/i)).toBeVisible({ timeout: 15000 });
-    await page.getByRole("button", { name: /Cancel/i }).click();
+    await page.getByRole("button", { name: /Cancel/i }).first().click();
     await expect(page.getByRole("button", { name: /Start video chat/i })).toBeVisible({ timeout: 10000 });
     await ctx.close();
   });

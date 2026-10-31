@@ -70,7 +70,9 @@ async function main() {
       url: `http://${cfg.host}:${cfg.port}`,
       state: store.mode,
       moderation: moderation.mode,
-      turn: cfg.turnUrl ? "configured" : "STUN-only (set TURN_URL for NAT-traversal safety)",
+      turn: cfg.turnUrls.length || cfg.turnUrl
+        ? "configured"
+        : "STUN-only (set TURN_URLS and credentials for NAT-traversal safety)",
     });
   });
 

@@ -221,7 +221,12 @@ describe("private rooms", () => {
     const deliveredMessage = waitFor(host, "room:chat");
     const chatAck = await emit(guest, "room:chat", { roomId: created.roomId, text: "private room hello" });
     expect(chatAck.ok).toBe(true);
-    expect(await deliveredMessage).toMatchObject({ from: guest.id, username: "guest1", text: "private room hello" });
+    expect(await deliveredMessage).toMatchObject({
+      roomId: created.roomId,
+      from: guest.id,
+      username: "guest1",
+      text: "private room hello",
+    });
 
     const deliveredCandidate = waitFor(guest, "webrtc:ice");
     const candidateAck = await emit(host, "webrtc:ice", {

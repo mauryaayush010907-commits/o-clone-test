@@ -30,15 +30,59 @@ export async function getMedia() {
   });
 }
 
-export function makePeerConnection({ iceServers, onIce, onTrack, onState, onGathering }) {
+export function makePeerConnection({
+  iceServers,
+  onIce,
+  onTrack,
+  onState,
+  onIceState,
+  onIceError,
+  onSignaling,
+  onGathering,
+}) {
   const pc = new RTCPeerConnection({ iceServers });
   pc.onicecandidate = (e) => {
     onIce(e.candidate ? e.candidate.toJSON() : null);
   };
   pc.ontrack = onTrack;
   pc.onconnectionstatechange = () => onState(pc.connectionState);
+  pc.oniceconnectionstatechange = () => onIceState && onIceState(pc.iceConnectionState);
+  pc.onicecandidateerror = (event) => onIceError && onIceError({
+    errorCode: Number.isInteger(event.errorCode) ? event.errorCode : null,
+    isTurnServer: typeof event.url === "string" && /^turns?:/i.test(event.url),
+  });
+  pc.onsignalingstatechange = () => onSignaling && onSignaling(pc.signalingState);
   pc.onicegatheringstatechange = () => onGathering && onGathering(pc.iceGatheringState);
   return pc;
+}
+
+export async function selectedCandidatePairTypes(pc) {
+  if (!pc || typeof pc.getStats !== "function") return null;
+  const stats = await pc.getStats();
+  let pair = [...stats.values()].find((report) =>
+    report.type === "candidate-pair" && report.selected === true
+  );
+  if (!pair) {
+    const transport = [...stats.values()].find((report) =>
+      report.type === "transport" && report.selectedCandidatePairId
+    );
+    if (transport) pair = stats.get(transport.selectedCandidatePairId);
+  }
+  if (!pair) {
+    pair = [...stats.values()].find((report) =>
+      report.type === "candidate-pair" && report.nominated && report.state === "succeeded"
+    );
+  }
+  if (!pair) return null;
+
+  const local = stats.get(pair.localCandidateId);
+  const remote = stats.get(pair.remoteCandidateId);
+  return {
+    state: pair.state,
+    localCandidateType: local?.candidateType || null,
+    remoteCandidateType: remote?.candidateType || null,
+    protocol: pair.protocol || local?.protocol || null,
+  };
 }
 
 export async function createOffer(pc) {

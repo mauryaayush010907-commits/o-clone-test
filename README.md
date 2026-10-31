@@ -132,7 +132,25 @@ npm run build
 
 - The browser gets `[{urls:[stun…]}, {urls:[turn…], username, credential}]` from `GET /api/ice-servers`.
 - Without TURN, most NATs still connect via host/srvreflexive candidates; **heavy NATs (symmetric) need TURN.**
-- On `iceconnectionstatechange === "failed"`, the UI offers a retry; the offerer auto-retries negotiation up to 2×, and TURN (when configured) provides the relay fallback.
+- Offerer retries are bounded to two retries. Temporary disconnects get a short recovery window; final failure ends the match and offers a clean new match instead of keeping the connecting overlay open.
+- Browser diagnostics report signaling/ICE/connection states and candidate types only; they never log SDP, candidate addresses, or TURN credentials.
+
+### Metered TURN
+
+Set these on the **Render backend**, using the TURN URIs and credentials currently issued in the Metered dashboard:
+
+```
+TURN_URLS=<provider-issued-turn-uris>
+TURN_USERNAME=<provider-issued-username>
+TURN_PASSWORD=<provider-issued-credential>
+TURN_USE_CONFIG=false
+```
+
+Include UDP/TCP variants only when Metered documents them for your relay endpoint. The backend returns the TURN username/credential to the browser through `/api/ice-servers` because WebRTC clients must authenticate to the relay; do not put account/API secrets in Vercel variables or source files. A non-empty credential in this response confirms only that one was configured, not that the provider accepts it.
+
+On **Vercel**, set `VITE_API_URL` and `VITE_SOCKET_URL` to the Render backend origin, then redeploy the frontend; Vite bakes these variables into the bundle at build time. Confirm `/api/ice-servers` returns the expected STUN/TURN URLs and `turnConfigured: true`. If that field is absent, Render is serving an older backend build and should be redeployed from the current source.
+
+Never commit deployment credentials in `.env.example`. If a real provider credential has been committed, revoke/rotate it with the provider and update Render.
 
 ### Coturn on a VPS (Ubuntu/Debian)
 

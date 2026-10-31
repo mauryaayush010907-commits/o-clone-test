@@ -9,12 +9,32 @@
  */
 import Redis from "ioredis";
 
+function roomDataFromRedis(raw) {
+  if (!raw) return null;
+  const data = JSON.parse(raw);
+  const entries = (value) => Array.isArray(value) ? value : Object.entries(value || {});
+  return {
+    ...data,
+    members: new Map(entries(data.members)),
+    pending: new Map(entries(data.pending)),
+  };
+}
+
+function roomDataToRedis(data) {
+  return JSON.stringify({
+    ...data,
+    members: [...data.members.entries()],
+    pending: [...data.pending.entries()],
+  });
+}
+
 export class MemoryStore {
   constructor() {
     this.mode = "memory";
     this.queues = { video: new Map(), text: new Map() }; // id -> ts, insertion order = FIFO
     this.queuesTs = { video: new Map(), text: new Map() };
     this.matches = new Map(); // matchId -> { a, b, mode, ts }
+    this.matchBySocket = new Map(); // socketId -> matchId
     this.counters = new Map();
     this.prefs = new Map(); // socketId -> { prefs, expanded, expiresAt }
     // Private-room state (mirrors Redis: roomMeta + roomMembers + token table).
@@ -69,18 +89,30 @@ export class MemoryStore {
 
   async matchSet(matchId, data, ttlMs) {
     this.matches.set(matchId, { ...data, expiresAt: Date.now() + ttlMs });
+    this.matchBySocket.set(data.a, matchId);
+    this.matchBySocket.set(data.b, matchId);
   }
   async matchGet(matchId) {
     const m = this.matches.get(matchId);
     if (!m) return null;
     if (m.expiresAt && m.expiresAt < Date.now()) {
       this.matches.delete(matchId);
+      if (this.matchBySocket.get(m.a) === matchId) this.matchBySocket.delete(m.a);
+      if (this.matchBySocket.get(m.b) === matchId) this.matchBySocket.delete(m.b);
       return null;
     }
     return m;
   }
   async matchDel(matchId) {
+    const m = this.matches.get(matchId);
     this.matches.delete(matchId);
+    if (m && this.matchBySocket.get(m.a) === matchId) this.matchBySocket.delete(m.a);
+    if (m && this.matchBySocket.get(m.b) === matchId) this.matchBySocket.delete(m.b);
+  }
+  async matchForSocket(socketId) {
+    const matchId = this.matchBySocket.get(socketId);
+    if (!matchId) return null;
+    return await this.matchGet(matchId) ? matchId : null;
   }
   async matchCount() {
     const now = Date.now();
@@ -94,6 +126,8 @@ export class MemoryStore {
     for (const [id, m] of this.matches) {
       if (now - (m.ts || 0) > maxAgeMs) {
         this.matches.delete(id);
+        if (this.matchBySocket.get(m.a) === id) this.matchBySocket.delete(m.a);
+        if (this.matchBySocket.get(m.b) === id) this.matchBySocket.delete(m.b);
         removed++;
       }
     }
@@ -109,7 +143,12 @@ export class MemoryStore {
   }
 
   async prefsSet(id, data, ttlMs) {
-    this.prefs.set(id, { prefs: data.prefs, expanded: !!data.expanded, expiresAt: Date.now() + ttlMs });
+    this.prefs.set(id, {
+      prefs: data.prefs,
+      expanded: !!data.expanded,
+      generation: data.generation || null,
+      expiresAt: Date.now() + ttlMs,
+    });
   }
   async prefsGet(id) {
     const p = this.prefs.get(id);
@@ -118,7 +157,7 @@ export class MemoryStore {
       this.prefs.delete(id);
       return null;
     }
-    return { prefs: p.prefs, expanded: p.expanded };
+    return { prefs: p.prefs, expanded: p.expanded, generation: p.generation || null };
   }
   async prefsDel(id) {
     this.prefs.delete(id);
@@ -346,22 +385,50 @@ export class RedisStore {
       "mode",
       data.mode,
       "ts",
-      String(data.ts || Date.now())
+      String(data.ts || Date.now()),
+      "aGeneration",
+      String(data.aGeneration || ""),
+      "bGeneration",
+      String(data.bGeneration || "")
     );
     pipe.pexpire(`match:${matchId}`, ttlMs);
+    pipe.set(`match:user:${data.a}`, matchId, "PX", ttlMs);
+    pipe.set(`match:user:${data.b}`, matchId, "PX", ttlMs);
     pipe.incr("matchcount");
     await pipe.exec();
   }
   async matchGet(matchId) {
     const h = await this.redis.hgetall(`match:${matchId}`);
     if (!h || !h.a || !h.b) return null;
-    return { a: h.a, b: h.b, mode: h.mode, ts: h.ts ? parseInt(h.ts, 10) : 0 };
+    return {
+      a: h.a,
+      b: h.b,
+      mode: h.mode,
+      ts: h.ts ? parseInt(h.ts, 10) : 0,
+      aGeneration: h.aGeneration || null,
+      bGeneration: h.bGeneration || null,
+    };
   }
   async matchDel(matchId) {
-    const pipe = this.redis.pipeline();
-    pipe.del(`match:${matchId}`);
-    pipe.decr("matchcount");
-    await pipe.exec();
+    await this.redis.eval(
+      `
+      local a = redis.call('HGET', KEYS[1], 'a')
+      local b = redis.call('HGET', KEYS[1], 'b')
+      if not a then return 0 end
+      redis.call('DEL', KEYS[1])
+      if redis.call('GET', 'match:user:' .. a) == ARGV[1] then redis.call('DEL', 'match:user:' .. a) end
+      if redis.call('GET', 'match:user:' .. b) == ARGV[1] then redis.call('DEL', 'match:user:' .. b) end
+      redis.call('DECR', 'matchcount')
+      return 1`,
+      1,
+      `match:${matchId}`,
+      matchId
+    );
+  }
+  async matchForSocket(socketId) {
+    const matchId = await this.redis.get(`match:user:${socketId}`);
+    if (!matchId || !await this.matchGet(matchId)) return null;
+    return matchId;
   }
   async matchCount() {
     const n = await this.redis.get("matchcount");
@@ -382,7 +449,11 @@ export class RedisStore {
   }
 
   async prefsSet(id, data, ttlMs) {
-    await this.redis.set(`prefs:${id}`, JSON.stringify({ prefs: data.prefs, expanded: !!data.expanded }), "PX", ttlMs);
+    await this.redis.set(`prefs:${id}`, JSON.stringify({
+      prefs: data.prefs,
+      expanded: !!data.expanded,
+      generation: data.generation || null,
+    }), "PX", ttlMs);
   }
   async prefsGet(id) {
     const raw = await this.redis.get(`prefs:${id}`);
@@ -418,128 +489,179 @@ export class RedisStore {
   // ---------------------------------------------------------------------
 
   async roomSetMeta(id, meta, ttlMs) {
-    this.rooms.set(id, { ...meta, expiresAt: Date.now() + ttlMs });
+    const key = `room:${id}:meta`;
+    const existing = await this.roomGetMeta(id);
+    const { expiresAt, ...metadata } = existing || {};
+    const merged = { ...metadata };
+    for (const [name, value] of Object.entries(meta)) {
+      if (value !== undefined) merged[name] = value;
+    }
+    await this.redis.set(key, JSON.stringify(merged), "PX", ttlMs);
+    return { ...merged, expiresAt: Date.now() + ttlMs };
   }
   async roomGetMeta(id) {
-    const m = this.rooms.get(id);
-    if (!m) return null;
-    if (m.expiresAt && m.expiresAt < Date.now()) {
-      this.rooms.delete(id);
-      this.roomMembers.delete(id);
-      return null;
-    }
-    return m;
+    const [raw, ttlMs] = await Promise.all([
+      this.redis.get(`room:${id}:meta`),
+      this.redis.pttl(`room:${id}:meta`),
+    ]);
+    if (!raw) return null;
+    return { ...JSON.parse(raw), expiresAt: ttlMs > 0 ? Date.now() + ttlMs : undefined };
   }
   async roomDelMeta(id) {
-    this.rooms.delete(id);
-    this.roomMembers.delete(id);
+    await this.redis.del(`room:${id}:meta`, `room:${id}:members`);
   }
 
   async roomCreate(id, hostSocketId, ttlMs) {
-    // Members: keyed Set<socketId, { username, isHost, joinedAt }>.
-    // Pending: Map<requestId, { socketId, username, ts }>.
-    this.roomMembers.set(id, {
+    const members = {
       host: hostSocketId,
       members: new Map([[hostSocketId, { username: null, isHost: true, joinedAt: Date.now() }]]),
       pending: new Map(),
       locked: false,
       ts: Date.now(),
       expiresAt: Date.now() + ttlMs,
-    });
+    };
+    await this.redis.set(`room:${id}:members`, roomDataToRedis(members), "PX", ttlMs);
   }
   async roomGetMembers(id) {
-    const m = this.roomMembers.get(id);
+    const key = `room:${id}:members`;
+    const [raw, ttlMs] = await Promise.all([this.redis.get(key), this.redis.pttl(key)]);
+    const m = roomDataFromRedis(raw);
     if (!m) return null;
-    if (m.expiresAt && m.expiresAt < Date.now()) {
-      this.roomMembers.delete(id);
-      this.rooms.delete(id);
-      return null;
-    }
+    m.expiresAt = ttlMs > 0 ? Date.now() + ttlMs : undefined;
     return m;
   }
-  /**
-   * Atomic "add a member if there's room". Returns the updated members map
-   * on success, or null if the room is full / missing. This is the only
-   * path that ever mutates room capacity, so it's the only place the
-   * five-person cap is enforced.
-   */
   async roomAddMemberIfRoom(id, socketId, entry, max = 5) {
-    const m = this.roomMembers.get(id);
-    if (!m) return null;
-    if (m.members.has(socketId)) return m; // already in the room — no-op
-    if (m.members.size >= max) return null; // full
-    m.members.set(socketId, entry);
-    return m;
+    const key = `room:${id}:members`;
+    const result = await this.redis.eval(
+      `
+      local raw = redis.call('GET', KEYS[1])
+      if not raw then return false end
+      local data = cjson.decode(raw)
+      for _, member in ipairs(data.members) do
+        if member[1] == ARGV[1] then return raw end
+      end
+      if #data.members >= tonumber(ARGV[3]) then return false end
+      table.insert(data.members, { ARGV[1], cjson.decode(ARGV[2]) })
+      redis.call('SET', KEYS[1], cjson.encode(data), 'PX', redis.call('PTTL', KEYS[1]))
+      return cjson.encode(data)`,
+      1,
+      key,
+      socketId,
+      JSON.stringify(entry),
+      max
+    );
+    return roomDataFromRedis(result);
   }
   async roomRemoveMember(id, socketId) {
-    const m = this.roomMembers.get(id);
-    if (!m) return null;
-    m.members.delete(socketId);
-    // Auto-cleanup: an empty room is reaped immediately.
-    if (m.members.size === 0) {
-      this.roomMembers.delete(id);
-      this.rooms.delete(id);
-      return { empty: true, m: null };
-    }
-    return { empty: false, m };
+    const result = await this.redis.eval(
+      `
+      local raw = redis.call('GET', KEYS[1])
+      if not raw then return false end
+      local data = cjson.decode(raw)
+      local members = {}
+      for _, member in ipairs(data.members) do
+        if member[1] ~= ARGV[1] then table.insert(members, member) end
+      end
+      data.members = members
+      if #members == 0 then
+        redis.call('DEL', KEYS[1], KEYS[2])
+        return cjson.encode({ empty = true })
+      end
+      redis.call('SET', KEYS[1], cjson.encode(data), 'PX', redis.call('PTTL', KEYS[1]))
+      return cjson.encode({ empty = false, data = data })`,
+      2,
+      `room:${id}:members`,
+      `room:${id}:meta`,
+      socketId
+    );
+    if (!result) return null;
+    const parsed = JSON.parse(result);
+    return { empty: parsed.empty, m: parsed.data ? roomDataFromRedis(JSON.stringify(parsed.data)) : null };
   }
   async roomSetLocked(id, locked) {
-    const m = this.roomMembers.get(id);
-    if (!m) return null;
-    m.locked = !!locked;
-    return m;
+    const result = await this.redis.eval(
+      `
+      local raw = redis.call('GET', KEYS[1])
+      if not raw then return false end
+      local data = cjson.decode(raw)
+      data.locked = ARGV[1] == '1'
+      redis.call('SET', KEYS[1], cjson.encode(data), 'PX', redis.call('PTTL', KEYS[1]))
+      return cjson.encode(data)`,
+      1,
+      `room:${id}:members`,
+      locked ? "1" : "0"
+    );
+    return roomDataFromRedis(result);
   }
 
   async roomAddPending(id, requestId, info) {
-    const m = this.roomMembers.get(id);
-    if (!m) return null;
-    m.pending.set(requestId, info);
-    return m;
+    const result = await this.redis.eval(
+      `
+      local raw = redis.call('GET', KEYS[1])
+      if not raw then return false end
+      local data = cjson.decode(raw)
+      data.pending = data.pending or {}
+      table.insert(data.pending, { ARGV[1], cjson.decode(ARGV[2]) })
+      redis.call('SET', KEYS[1], cjson.encode(data), 'PX', redis.call('PTTL', KEYS[1]))
+      return cjson.encode(data)`,
+      1,
+      `room:${id}:members`,
+      requestId,
+      JSON.stringify(info)
+    );
+    return roomDataFromRedis(result);
   }
   async roomRemovePending(id, requestId) {
-    const m = this.roomMembers.get(id);
-    if (!m) return null;
-    return m.pending.delete(requestId);
+    return (await this.redis.eval(
+      `
+      local raw = redis.call('GET', KEYS[1])
+      if not raw then return 0 end
+      local data = cjson.decode(raw)
+      local pending = {}
+      local removed = 0
+      for _, item in ipairs(data.pending or {}) do
+        if item[1] == ARGV[1] then removed = 1 else table.insert(pending, item) end
+      end
+      if removed == 1 then
+        data.pending = pending
+        redis.call('SET', KEYS[1], cjson.encode(data), 'PX', redis.call('PTTL', KEYS[1]))
+      end
+      return removed`,
+      1,
+      `room:${id}:members`,
+      requestId
+    )) === 1;
   }
   async roomPendingGet(id, requestId) {
-    const m = this.roomMembers.get(id);
-    if (!m) return null;
-    return m.pending.get(requestId) || null;
+    const m = await this.roomGetMembers(id);
+    return m?.pending.get(requestId) || null;
   }
 
   // ----- Username reservation (case-insensitive, TTL'd) -----
   async usernameReserve(lower, username, socketId, ttlMs) {
-    const existing = this.usernameIndex.get(lower);
-    if (existing && existing.expiresAt > Date.now() && existing.socketId !== socketId) return false;
-    this.usernameIndex.set(lower, { username, socketId, expiresAt: Date.now() + ttlMs });
+    const key = `username:${lower}`;
+    const value = JSON.stringify({ username, socketId });
+    if (await this.redis.set(key, value, "NX", "PX", ttlMs) === "OK") return true;
+    const existing = await this.redis.get(key);
+    if (!existing) return this.redis.set(key, value, "NX", "PX", ttlMs).then((result) => result === "OK");
+    if (JSON.parse(existing).socketId !== socketId) return false;
+    await this.redis.set(key, value, "PX", ttlMs);
     return true;
   }
   async usernameGet(lower) {
-    const r = this.usernameIndex.get(lower);
-    if (!r) return null;
-    if (r.expiresAt < Date.now()) {
-      this.usernameIndex.delete(lower);
-      return null;
-    }
-    return r;
+    const raw = await this.redis.get(`username:${lower}`);
+    return raw ? JSON.parse(raw) : null;
   }
   async usernameRelease(socketId) {
-    for (const [k, v] of this.usernameIndex) {
-      if (v.socketId === socketId) this.usernameIndex.delete(k);
+    const stream = this.redis.scanStream({ match: "username:*", count: 100 });
+    for await (const keys of stream) {
+      for (const key of keys) {
+        const raw = await this.redis.get(key);
+        if (raw && JSON.parse(raw).socketId === socketId) await this.redis.del(key);
+      }
     }
   }
 
-  // ----- Code-attempt rate limit -----
-  async codeAttemptHit(ipKey, windowMs, max) {
-    const now = Date.now();
-    const e = this.codeAttempts.get(ipKey);
-    if (!e || e.resetAt < now) {
-      this.codeAttempts.set(ipKey, { count: 1, resetAt: now + windowMs });
-      return 1;
-    }
-    e.count += 1;
-    return e.count;
-  }
 }
 
 

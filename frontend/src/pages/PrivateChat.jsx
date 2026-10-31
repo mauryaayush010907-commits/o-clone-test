@@ -35,6 +35,8 @@ export default function PrivateChat() {
 
   // ---- room state ----
   const [stage, setStage] = useState("landing");
+  const stageRef = useRef(stage);
+  stageRef.current = stage;
   const [roomCode, setRoomCode] = useState("");
   const [roomId, setRoomId] = useState("");
   const [isHost, setIsHost] = useState(false);
@@ -65,8 +67,13 @@ export default function PrivateChat() {
 
   // ---- refs (mutable, no re-render) ----
   const rtRef = useRef(null);
+  const rtStatusRef = useRef("connecting");
   const roomIdRef = useRef("");
   roomIdRef.current = roomId;
+  const joinedRoomRef = useRef("");
+  const pendingJoinRoomRef = useRef("");
+  const roomGenerationRef = useRef(0);
+  const announcedPeersRef = useRef(new Set());
   const localStreamRef = useRef(null);
   const peersRef = useRef(new Map()); // socketId -> { pc, remoteStream, username, isHost }
   const pendingIceRef = useRef(new Map());
@@ -76,12 +83,40 @@ export default function PrivateChat() {
   // -------- room socket lifecycle --------
   useEffect(() => {
     const rt = new RoomRT({
-      onStatus: (s) => setRtStatus(s),
+      onStatus: (s) => {
+        const wasLive = rtStatusRef.current === "live";
+        rtStatusRef.current = s;
+        setRtStatus(s);
+        if (wasLive && s !== "live" && roomIdRef.current) {
+          roomGenerationRef.current += 1;
+          joinedRoomRef.current = "";
+          pendingJoinRoomRef.current = "";
+          announcedPeersRef.current.clear();
+          roomIdRef.current = "";
+          setRoomId("");
+          setRoomCode("");
+          setIsHost(false);
+          setStage("landing");
+          setPeers([]);
+          setPeerStreams({});
+          setPending([]);
+          teardownAllPeers();
+          if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach((track) => track.stop());
+            localStreamRef.current = null;
+          }
+          showToast("Room connection lost. Please join the room again.");
+        }
+      },
       onEvent: (ev, d) => handleEventRef.current(ev, d),
     });
     rtRef.current = rt;
     return () => {
       try { rt.send("room:leave"); } catch {}
+      roomGenerationRef.current += 1;
+      joinedRoomRef.current = "";
+      pendingJoinRoomRef.current = "";
+      announcedPeersRef.current.clear();
       rt.close();
       teardownAllPeers();
       if (localStreamRef.current) {
@@ -103,23 +138,32 @@ export default function PrivateChat() {
         break;
       }
       case "room:join-accepted": {
+        if (pendingJoinRoomRef.current === d.roomId || joinedRoomRef.current === d.roomId) return;
+        const generation = ++roomGenerationRef.current;
+        const socket = rtRef.current?.socket;
+        pendingJoinRoomRef.current = d.roomId;
         roomIdRef.current = d.roomId;
         setRoomId(d.roomId);
         setIsHost(false);
         const list = (d.members || []).filter((m) => m.socketId !== rtRef.current?.socket?.id);
         setPeers(list);
         setRoomLocked(false);
-        ensureLocalMedia().then(() => {
-          const socket = rtRef.current?.socket;
-          if (!socket?.connected) {
+        ensureLocalMedia(generation).then((stream) => {
+          if (!stream || generation !== roomGenerationRef.current ||
+            roomIdRef.current !== d.roomId || rtRef.current?.socket !== socket || !socket?.connected) {
+            if (pendingJoinRoomRef.current === d.roomId) pendingJoinRoomRef.current = "";
             showToast("Disconnected from the room server. Reconnect and try again.");
             return;
           }
           socket.emit("room:join", { roomId: d.roomId, isHost: false }, (ack) => {
-            if (!ack?.ok) {
-              showToast("Could not join room signaling. Please leave and rejoin.");
+            if (!ack?.ok || generation !== roomGenerationRef.current ||
+              roomIdRef.current !== d.roomId || rtRef.current?.socket !== socket || !socket.connected) {
+              if (pendingJoinRoomRef.current === d.roomId) pendingJoinRoomRef.current = "";
+              if (!ack?.ok) showToast("Could not join room signaling. Please leave and rejoin.");
               return;
             }
+            joinedRoomRef.current = d.roomId;
+            pendingJoinRoomRef.current = "";
             setPeers((ack.others || []).filter((peer) => peer.socketId !== socket.id));
             setStage("in-room");
             showToast("You joined the room");
@@ -128,45 +172,86 @@ export default function PrivateChat() {
         break;
       }
       case "room:join-rejected": {
+        roomGenerationRef.current += 1;
+        joinedRoomRef.current = "";
+        pendingJoinRoomRef.current = "";
+        announcedPeersRef.current.clear();
         setRejectionReason(d?.reason || "rejected");
         setStage("landing");
         setRoomCode(""); setRoomId(""); setIsHost(false);
+        roomIdRef.current = "";
         setPending([]); setPeers([]);
         break;
       }
       case "room:removed": {
+        rtRef.current?.send("room:leave");
+        roomGenerationRef.current += 1;
+        joinedRoomRef.current = "";
+        pendingJoinRoomRef.current = "";
         setStage("landing");
         setRoomCode(""); setRoomId(""); setIsHost(false);
         roomIdRef.current = "";
         setPending([]); setPeers([]);
+        announcedPeersRef.current.clear();
         teardownAllPeers();
+        if (localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach((track) => track.stop());
+          localStreamRef.current = null;
+        }
         showToast("You were removed from the room");
         break;
       }
       case "room:closed": {
+        rtRef.current?.send("room:leave");
+        roomGenerationRef.current += 1;
+        joinedRoomRef.current = "";
+        pendingJoinRoomRef.current = "";
         setStage("landing");
         setRoomCode(""); setRoomId(""); setIsHost(false);
         roomIdRef.current = "";
         setPending([]); setPeers([]);
+        announcedPeersRef.current.clear();
         teardownAllPeers();
+        if (localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach((track) => track.stop());
+          localStreamRef.current = null;
+        }
         showToast("The host closed the room");
         break;
       }
       case "room:peers": {
+        if (d.roomId !== roomIdRef.current) return;
         const list = (d.members || []).filter((m) => m.socketId !== rtRef.current?.socket?.id);
+        const currentIds = new Set(list.map((peer) => peer.socketId));
+        for (const peerId of announcedPeersRef.current) {
+          if (!currentIds.has(peerId)) announcedPeersRef.current.delete(peerId);
+        }
         setPeers(list);
         break;
       }
       case "room:peer-joined": {
+        if (d.roomId !== roomIdRef.current || joinedRoomRef.current !== d.roomId) return;
         if (d.socketId === rtRef.current?.socket?.id) return;
+        if (announcedPeersRef.current.has(d.socketId)) return;
+        announcedPeersRef.current.add(d.socketId);
         setPeers((prev) => {
           if (prev.find((p) => p.socketId === d.socketId)) return prev;
           return [...prev, { socketId: d.socketId, username: d.username, isHost: !!d.isHost, joinedAt: Date.now() }];
         });
-        ensureLocalMedia().then(() => connectToPeer(d, /*initiator=*/ true));
+        if (stageRef.current !== "in-room") return;
+        const generation = roomGenerationRef.current;
+        const activeRoomId = roomIdRef.current;
+        ensureLocalMedia(generation).then((stream) => {
+          if (stream && generation === roomGenerationRef.current &&
+            activeRoomId === roomIdRef.current && stageRef.current === "in-room") {
+            connectToPeer(d, true, generation, activeRoomId);
+          }
+        });
         break;
       }
       case "room:peer-left": {
+        if (d.roomId !== roomIdRef.current) return;
+        announcedPeersRef.current.delete(d.socketId);
         setPeers((prev) => prev.filter((p) => p.socketId !== d.socketId));
         teardownPeer(d.socketId);
         setPeerStreams((s) => {
@@ -182,23 +267,33 @@ export default function PrivateChat() {
         break;
       }
       case "room:chat": {
+        if (d.roomId !== roomIdRef.current) return;
         setMessages((m) => [...m, { from: d.from, username: d.username, text: d.text, ts: d.ts, mine: d.from === rtRef.current?.socket?.id }]);
         break;
       }
       case "room:status": {
+        if (d.roomId !== roomIdRef.current) return;
         setPeersStatus((s) => ({ ...s, [d.from]: { mic: !!d.mic, cam: !!d.cam } }));
         break;
       }
       case "webrtc:offer": {
-        handleRemoteOffer(d.from, d.sdp);
+        if (import.meta.env.DEV) {
+          console.debug("Private-room offer received", {
+            matchId: d.roomId,
+            roomId: d.roomId,
+            socketId: rtRef.current?.socket?.id,
+            from: d.from,
+          });
+        }
+        handleRemoteOffer(d, d.from, d.sdp);
         break;
       }
       case "webrtc:answer": {
-        handleRemoteAnswer(d.from, d.sdp);
+        handleRemoteAnswer(d, d.from, d.sdp);
         break;
       }
       case "webrtc:ice": {
-        handleRemoteIce(d.from, d.candidate);
+        handleRemoteIce(d, d.from, d.candidate);
         break;
       }
       case "error": {
@@ -216,7 +311,8 @@ export default function PrivateChat() {
   useEffect(() => { handleEventRef.current = handleEvent; }, [handleEvent]);
 
   // -------- Local media + ICE config --------
-  const ensureLocalMedia = useCallback(async () => {
+  const ensureLocalMedia = useCallback(async (generation = roomGenerationRef.current) => {
+    if (generation !== roomGenerationRef.current) return null;
     if (localStreamRef.current) return localStreamRef.current;
     if (typeof window === "undefined" || !navigator?.mediaDevices) return null;
     try {
@@ -224,6 +320,10 @@ export default function PrivateChat() {
         audio: true,
         video: { width: { ideal: 1280 }, height: { ideal: 720 } },
       });
+      if (generation !== roomGenerationRef.current || !rtRef.current?.socket?.connected) {
+        stream.getTracks().forEach((track) => track.stop());
+        return null;
+      }
       localStreamRef.current = stream;
       stream.getAudioTracks().forEach((t) => (t.enabled = micOn));
       stream.getVideoTracks().forEach((t) => (t.enabled = camOn));
@@ -241,11 +341,18 @@ export default function PrivateChat() {
           rtcConfigRef.current = { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] };
         }
       }
+      if (generation !== roomGenerationRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        if (localStreamRef.current === stream) localStreamRef.current = null;
+        return null;
+      }
       // Trigger a re-render so the local <video> picks up the new stream.
       setStreamRev((r) => r + 1);
       return stream;
     } catch (e) {
-      showToast("Camera or microphone permission denied");
+      if (generation === roomGenerationRef.current) {
+        showToast("Camera or microphone permission denied");
+      }
       return null;
     }
   }, [micOn, camOn]);
@@ -263,6 +370,8 @@ export default function PrivateChat() {
   function ensurePeerEntry(socketId, opts = {}) {
     let entry = peersRef.current.get(socketId);
     if (entry) return entry;
+    const generation = roomGenerationRef.current;
+    const activeRoomId = roomIdRef.current;
     const pc = new RTCPeerConnection(rtcConfigRef.current || { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] });
     const stream = localStreamRef.current;
     if (stream) stream.getTracks().forEach((t) => pc.addTrack(t, stream));
@@ -274,22 +383,27 @@ export default function PrivateChat() {
       isHost: !!opts.isHost,
       joinedAt: Date.now(),
       creatingOffer: false,
+      handlingOffer: false,
+      generation,
+      roomId: activeRoomId,
     };
     pendingIceRef.current.delete(socketId);
     peersRef.current.set(socketId, entry);
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        sendRoomSignal("webrtc:ice", { to: socketId, candidate: e.candidate.toJSON() });
+        sendRoomSignal("webrtc:ice", { to: socketId, candidate: e.candidate.toJSON() }, generation, pc);
       }
     };
     pc.ontrack = (e) => {
+      if (!isCurrentPeer(socketId, entry, generation, activeRoomId)) return;
       const incoming = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
       entry.remoteStream = incoming;
       setPeerStreams((s) => ({ ...s, [socketId]: incoming }));
       setStreamRev((r) => r + 1);
     };
     pc.onconnectionstatechange = () => {
+      if (!isCurrentPeer(socketId, entry, generation, activeRoomId)) return;
       if (["failed", "closed"].includes(pc.connectionState)) {
         teardownPeer(socketId);
         setPeerStreams((streams) => {
@@ -304,17 +418,31 @@ export default function PrivateChat() {
     return entry;
   }
 
-  async function connectToPeer(peer, initiator) {
+  function isCurrentPeer(socketId, entry, generation, activeRoomId) {
+    const socket = rtRef.current?.socket;
+    return generation === roomGenerationRef.current &&
+      activeRoomId === roomIdRef.current &&
+      joinedRoomRef.current === activeRoomId &&
+      socket?.connected &&
+      peersRef.current.get(socketId) === entry &&
+      entry.generation === generation &&
+      entry.roomId === activeRoomId;
+  }
+
+  async function connectToPeer(peer, initiator, generation = roomGenerationRef.current, activeRoomId = roomIdRef.current) {
     if (!peer || !peer.socketId) return;
     const stream = localStreamRef.current;
-    if (!stream) return;
+    if (!stream || generation !== roomGenerationRef.current ||
+      activeRoomId !== roomIdRef.current || joinedRoomRef.current !== activeRoomId) return;
     const entry = ensurePeerEntry(peer.socketId, { username: peer.username, isHost: peer.isHost });
     if (!initiator || entry.creatingOffer || entry.pc.signalingState !== "stable") return;
     entry.creatingOffer = true;
     try {
       const offer = await entry.pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      if (!isCurrentPeer(peer.socketId, entry, generation, activeRoomId)) return;
       await entry.pc.setLocalDescription(offer);
-      sendRoomSignal("webrtc:offer", { to: peer.socketId, sdp: offer.sdp });
+      if (!isCurrentPeer(peer.socketId, entry, generation, activeRoomId)) return;
+      sendRoomSignal("webrtc:offer", { to: peer.socketId, sdp: entry.pc.localDescription?.sdp }, generation, entry.pc);
     } catch (error) {
       console.error("Could not create private-room video offer", error);
       showToast("Could not start video with a room participant.");
@@ -323,27 +451,53 @@ export default function PrivateChat() {
     }
   }
 
-  async function handleRemoteOffer(from, sdp) {
-    const stream = localStreamRef.current || await ensureLocalMedia();
-    if (!stream) return;
+  async function handleRemoteOffer(data, from, sdp) {
+    const generation = roomGenerationRef.current;
+    const activeRoomId = roomIdRef.current;
+    if (!data || data.roomId !== activeRoomId || joinedRoomRef.current !== activeRoomId ||
+      !from || typeof sdp !== "string") return;
+    const stream = localStreamRef.current || await ensureLocalMedia(generation);
+    if (!stream || generation !== roomGenerationRef.current || activeRoomId !== roomIdRef.current) return;
     const entry = ensurePeerEntry(from);
+    if (!isCurrentPeer(from, entry, generation, activeRoomId) || entry.handlingOffer ||
+      entry.pc.signalingState !== "stable") return;
+    entry.handlingOffer = true;
     try {
       await entry.pc.setRemoteDescription({ type: "offer", sdp });
+      if (!isCurrentPeer(from, entry, generation, activeRoomId)) return;
       await flushPendingIce(entry);
+      if (!isCurrentPeer(from, entry, generation, activeRoomId)) return;
       const answer = await entry.pc.createAnswer();
+      if (!isCurrentPeer(from, entry, generation, activeRoomId)) return;
       await entry.pc.setLocalDescription(answer);
-      sendRoomSignal("webrtc:answer", { to: from, sdp: answer.sdp });
+      if (!isCurrentPeer(from, entry, generation, activeRoomId)) return;
+      if (import.meta.env.DEV) {
+        console.debug("Private-room answer generated", {
+          matchId: activeRoomId,
+          roomId: activeRoomId,
+          socketId: rtRef.current?.socket?.id,
+          to: from,
+        });
+      }
+      sendRoomSignal("webrtc:answer", { to: from, sdp: entry.pc.localDescription?.sdp }, generation, entry.pc);
     } catch (error) {
       console.error("Could not answer private-room video offer", error);
       showToast("Could not connect video with a room participant.");
+    } finally {
+      if (peersRef.current.get(from) === entry) entry.handlingOffer = false;
     }
   }
 
-  async function handleRemoteAnswer(from, sdp) {
+  async function handleRemoteAnswer(data, from, sdp) {
+    if (!data || data.roomId !== roomIdRef.current || joinedRoomRef.current !== roomIdRef.current) return;
     const entry = peersRef.current.get(from);
-    if (!entry) return;
+    const generation = roomGenerationRef.current;
+    const activeRoomId = roomIdRef.current;
+    if (!entry || !isCurrentPeer(from, entry, generation, activeRoomId) ||
+      entry.pc.signalingState !== "have-local-offer") return;
     try {
       await entry.pc.setRemoteDescription({ type: "answer", sdp });
+      if (!isCurrentPeer(from, entry, generation, activeRoomId)) return;
       await flushPendingIce(entry);
     } catch (error) {
       console.error("Could not apply private-room video answer", error);
@@ -351,11 +505,14 @@ export default function PrivateChat() {
     }
   }
 
-  async function handleRemoteIce(from, candidate) {
+  async function handleRemoteIce(data, from, candidate) {
+    if (!data || data.roomId !== roomIdRef.current || joinedRoomRef.current !== roomIdRef.current) return;
     const entry = peersRef.current.get(from);
-    if (entry && entry.pc.remoteDescription) {
+    const generation = roomGenerationRef.current;
+    const activeRoomId = roomIdRef.current;
+    if (entry && isCurrentPeer(from, entry, generation, activeRoomId) && entry.pc.remoteDescription) {
       try {
-        entry.pc.addIceCandidate(candidate).catch((error) => {
+        await entry.pc.addIceCandidate(candidate).catch((error) => {
           console.error("Could not add private-room ICE candidate", error);
         });
       } catch (error) {
@@ -383,18 +540,26 @@ export default function PrivateChat() {
     }
   }
 
-  function sendRoomSignal(event, payload) {
+  function sendRoomSignal(event, payload, generation = roomGenerationRef.current, pc = null) {
     const socket = rtRef.current?.socket;
     const activeRoomId = roomIdRef.current;
-    if (!socket?.connected || !activeRoomId) {
+    if (!socket?.connected || !activeRoomId || joinedRoomRef.current !== activeRoomId ||
+      generation !== roomGenerationRef.current ||
+      (pc && peersRef.current.get(payload.to)?.pc !== pc)) {
       console.warn(`Cannot send ${event}: private room connection is not ready`);
-      return;
+      return false;
     }
     socket.emit(event, { ...payload, roomId: activeRoomId }, (ack) => {
       if (!ack?.ok) {
-        console.warn(`Private-room ${event} rejected`, ack?.error || "unknown error");
+        console.warn(`Private-room ${event} rejected`, {
+          matchId: activeRoomId,
+          roomId: activeRoomId,
+          socketId: socket.id,
+          code: ack?.error || "unknown-error",
+        });
       }
     });
+    return true;
   }
 
   function teardownPeer(socketId) {
@@ -443,19 +608,47 @@ export default function PrivateChat() {
 
   const createRoom = async () => {
     if (rtStatus !== "live") { showToast("Connecting…"); return; }
-    rtRef.current.send("room:create");
+    const rt = rtRef.current;
+    const socket = rt?.socket;
+    const generation = ++roomGenerationRef.current;
+    if (!socket?.connected) { showToast("Connecting…"); return; }
     const ack = await new Promise((resolve) => {
       const t = setTimeout(() => resolve(null), 5000);
-      rtRef.current.socket?.once("room:create:ok", (r) => { clearTimeout(t); resolve(r); });
+      socket.emit("room:create", {}, (r) => { clearTimeout(t); resolve(r); });
     });
     if (!ack || !ack.ok) { showToast("Could not create room"); return; }
+    if (generation !== roomGenerationRef.current || rtRef.current?.socket !== socket || !socket.connected) {
+      socket.emit("room:close", { roomId: ack.roomId });
+      return;
+    }
+    const joinAck = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 5000);
+      socket.emit("room:join", { roomId: ack.roomId, isHost: true }, (result) => {
+        clearTimeout(t);
+        resolve(result);
+      });
+    });
+    if (!joinAck?.ok || generation !== roomGenerationRef.current ||
+      rtRef.current?.socket !== socket || !socket.connected) {
+      socket.emit("room:close", { roomId: ack.roomId });
+      showToast("Could not join room signaling. Please create the room again.");
+      return;
+    }
+    joinedRoomRef.current = ack.roomId;
+    pendingJoinRoomRef.current = "";
+    announcedPeersRef.current.clear();
+    if (import.meta.env.DEV) {
+      console.debug("Private-room join completed", {
+        matchId: ack.roomId,
+        roomId: ack.roomId,
+        socketId: socket.id,
+      });
+    }
     setRoomCode(ack.code);
     roomIdRef.current = ack.roomId;
     setRoomId(ack.roomId);
     setIsHost(true);
     setStage("create-result");
-    // The host joins the room namespace immediately so join-requests fire.
-    rtRef.current?.socket?.emit("room:join", { roomId: ack.roomId, isHost: true });
   };
 
   const requestJoin = async () => {
@@ -521,15 +714,26 @@ export default function PrivateChat() {
     rtRef.current?.send("room:close", { roomId });
   };
 
-  const enterRoom = () => {
+  const enterRoom = async () => {
     if (!roomId) return;
     setStage("in-room");
-    // Acquire local media and join the SFU namespace.
-    ensureLocalMedia();
+    const generation = roomGenerationRef.current;
+    const activeRoomId = roomId;
+    const stream = await ensureLocalMedia(generation);
+    if (!stream || generation !== roomGenerationRef.current ||
+      activeRoomId !== roomIdRef.current || joinedRoomRef.current !== activeRoomId) return;
+    for (const peer of peers) {
+      connectToPeer(peer, true, generation, activeRoomId);
+    }
   };
 
   const leaveRoom = () => {
-    rtRef.current?.send("room:leave");
+    if (isHost && roomIdRef.current) rtRef.current?.send("room:close", { roomId: roomIdRef.current });
+    else rtRef.current?.send("room:leave");
+    roomGenerationRef.current += 1;
+    joinedRoomRef.current = "";
+    pendingJoinRoomRef.current = "";
+    announcedPeersRef.current.clear();
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
@@ -621,7 +825,7 @@ export default function PrivateChat() {
             peers={peers}
             rtStatus={rtStatus}
             username={username}
-            onLeave={() => { setStage("landing"); setRoomCode(""); setRoomId(""); setIsHost(false); setPending([]); }}
+            onLeave={leaveRoom}
           />
         )}
         {stage === "pending-request" && (

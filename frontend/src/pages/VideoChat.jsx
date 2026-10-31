@@ -33,6 +33,8 @@ const END_LABELS = {
   disconnected: "The stranger disconnected",
   failed: "The connection could not be maintained",
 };
+const newMatchGeneration = () => globalThis.crypto?.randomUUID?.() ||
+  `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 
 export default function VideoChat() {
   const navigate = useNavigate();
@@ -58,6 +60,8 @@ export default function VideoChat() {
   const [expanded, setExpanded] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const applyingRef = useRef(false);
+  const nextInFlightRef = useRef(false);
+  const filterEndPromiseRef = useRef(null);
 
   const rtRef = useRef(null);
   const pcRef = useRef(null);
@@ -68,7 +72,15 @@ export default function VideoChat() {
   const offerInFlightRef = useRef(null);
   const remoteOfferInFlightRef = useRef(null);
   const connectionTimerRef = useRef(null);
-  const S = useRef({ phase: "idle", matchId: null, role: null, retry: 0, ice: null });
+  const S = useRef({
+    phase: "idle",
+    matchId: null,
+    role: null,
+    retry: 0,
+    ice: null,
+    generation: 0,
+    findGeneration: null,
+  });
   const matchStartRef = useRef(0);
   const typingTimerRef = useRef(null);
   const toastTimerRef = useRef(null);
@@ -93,27 +105,87 @@ export default function VideoChat() {
     // Modal calls onClose itself; we just make sure the matchmaking state
     // machine returns to idle so the user can hit Start again with the
     // currently-applied prefs.
-    if (S.current.state === "matched" || S.current.state === "connecting") {
+    if (["connecting", "live"].includes(S.current.phase)) {
       // safety: the modal's onClose should already have ended it
-    } else if (S.current.state === "queued") {
+    } else if (S.current.phase === "queued") {
       rtRef.current?.send("match:cancel");
     }
     setP("idle");
   };
-  const applyPrefs = (next) => {
+  const queueWithPrefs = (next) => {
+    const rt = rtRef.current;
+    if (!rt?.online) {
+      S.current.findGeneration = null;
+      showToast("Waiting for server connection…");
+      setP("idle");
+      applyingRef.current = false;
+      return;
+    }
+    const generation = newMatchGeneration();
+    S.current.findGeneration = generation;
+    S.current.generation += 1;
+    setP("queued");
+    rt.send("match:find", { ...toFindPayload("video", next), generation });
+    applyingRef.current = false;
+  };
+
+  const applyPrefs = async (next) => {
     if (applyingRef.current) return;
     applyingRef.current = true;
+    if (filterEndPromiseRef.current) {
+      const generation = S.current.generation;
+      const response = await filterEndPromiseRef.current;
+      filterEndPromiseRef.current = null;
+      if (generation !== S.current.generation) {
+        applyingRef.current = false;
+        return;
+      }
+      if (response?.ok !== true) {
+        applyingRef.current = false;
+        showToast("Could not end the current search. Please try again.");
+        return;
+      }
+    }
     savePrefs(next);
     setPrefs(next);
 
-    const wasMatched = S.current.state === "matched" || S.current.state === "connecting";
-    const wasQueued = S.current.state === "queued";
+    const matchId = S.current.matchId;
+    const wasMatched = !!matchId && ["connecting", "live"].includes(S.current.phase);
+    const wasQueued = S.current.phase === "queued";
     if (wasMatched) {
-      if (S.current.matchId) rtRef.current?.send("match:next", { matchId: S.current.matchId });
+      const request = rtRef.current?.sendWithAck("match:next", { matchId });
       teardown(false);
+      S.current.findGeneration = null;
+      setP("starting");
+      const transitionGeneration = S.current.generation;
+      const response = await request;
+      if (transitionGeneration !== S.current.generation || S.current.phase !== "starting") {
+        applyingRef.current = false;
+        return;
+      }
+      if (response?.ok !== true) {
+        applyingRef.current = false;
+        setP("ended");
+        showToast("Could not end the current match. Please try again.");
+        return;
+      }
       setMessages((m) => [...m, { system: true, text: "Filters updated — finding a new match…" }]);
     } else if (wasQueued) {
-      rtRef.current?.send("match:cancel");
+      const request = rtRef.current?.sendWithAck("match:cancel");
+      teardown(false);
+      S.current.findGeneration = null;
+      setP("starting");
+      const transitionGeneration = S.current.generation;
+      const response = await request;
+      if (transitionGeneration !== S.current.generation || S.current.phase !== "starting") {
+        applyingRef.current = false;
+        return;
+      }
+      if (response?.ok !== true) {
+        applyingRef.current = false;
+        showToast("Could not cancel matchmaking. Please try again.");
+        return;
+      }
       setMessages((m) => [...m, { system: true, text: "Filters updated — finding a new match…" }]);
     }
 
@@ -123,10 +195,9 @@ export default function VideoChat() {
       clearTimeout(S.current.expandTimer);
       S.current.expandTimer = null;
     }
-    setP("queued");
+    if (generation !== s.generation || s.phase !== "starting" || !rtRef.current?.online) return;
     setErrorInfo(null);
-    rtRef.current?.send("match:find", toFindPayload("video", next));
-    applyingRef.current = false;
+    queueWithPrefs(next);
   };
 
   // Backwards-compat alias.
@@ -141,22 +212,45 @@ export default function VideoChat() {
     toastTimerRef.current = setTimeout(() => setToast(""), ms);
   };
 
-  const sendWebRtcSignal = (event, payload) => {
+  const isCurrentSession = (matchId, generation, pc = null) => {
     const rt = rtRef.current;
-    if (!rt) {
-      console.warn("Could not send WebRTC signal: real-time client is unavailable", { event });
-      return;
+    return !!matchId && S.current.matchId === matchId &&
+      S.current.generation === generation &&
+      rt?.online && rt.socket?.connected &&
+      (!pc || pcRef.current === pc);
+  };
+
+  const sendWebRtcSignal = (event, payload, generation, pc = null) => {
+    const rt = rtRef.current;
+    if (!rt || !isCurrentSession(payload.matchId, generation, pc)) {
+      if (!rt || !rt.socket?.connected) {
+        console.warn("Could not send WebRTC signal: real-time client is unavailable", {
+          event, matchId: payload.matchId, generation,
+        });
+      }
+      return false;
     }
     const result = typeof rt.sendWithAck === "function"
       ? rt.sendWithAck(event, payload)
       : rt.send(event, payload);
     Promise.resolve(result).then((response) => {
       if (response?.ok === false) {
-        console.warn("WebRTC signal was rejected", { event, code: response.code || response.error });
+        const details = {
+          event,
+          matchId: payload.matchId,
+          generation,
+          socketId: rt.socket?.id,
+          code: response.code || response.error,
+        };
+        if (event === "webrtc:answer") console.warn("WebRTC answer rejected", details);
+        else console.warn("WebRTC signal was rejected", details);
       }
     }).catch((error) => {
-      console.warn("WebRTC signal could not be sent", { event, error });
+      console.warn("WebRTC signal could not be sent", {
+        event, matchId: payload.matchId, generation, error,
+      });
     });
+    return true;
   };
 
   const clearRemoteTyping = useCallback(() => {
@@ -176,6 +270,7 @@ export default function VideoChat() {
 
   const teardown = (stopLocal) => {
     const s = S.current;
+    s.generation += 1;
     clearRemoteTyping();
     if (connectionTimerRef.current) clearTimeout(connectionTimerRef.current);
     connectionTimerRef.current = null;
@@ -188,7 +283,11 @@ export default function VideoChat() {
       pcRef.current = null;
     }
     s.matchId = null;
+    s.role = null;
     s.retry = 0;
+    offerInFlightRef.current = null;
+    remoteOfferInFlightRef.current = null;
+    iceFlushRef.current = false;
     pendingIceRef.current = [];
     remoteStreamRef.current = null;
     const el = videoRef.current;
@@ -201,11 +300,12 @@ export default function VideoChat() {
     }
   };
 
-  const flushIce = async () => {
-    if (iceFlushRef.current) return;
-    iceFlushRef.current = true;
+  const flushIce = async (generation = S.current.generation) => {
+    if (iceFlushRef.current === generation) return;
+    iceFlushRef.current = generation;
     try {
       while (pendingIceRef.current.length) {
+        if (generation !== S.current.generation) return;
         const entry = pendingIceRef.current[0];
         if (entry.matchId !== S.current.matchId || entry.attempt < S.current.retry) {
           pendingIceRef.current.shift();
@@ -217,6 +317,7 @@ export default function VideoChat() {
         pendingIceRef.current.shift();
         try {
           await pc.addIceCandidate(entry.candidate);
+          if (generation !== S.current.generation || pc !== pcRef.current) return;
         } catch (error) {
           console.warn("Could not add queued video-chat ICE candidate", {
             matchId: S.current.matchId,
@@ -226,11 +327,12 @@ export default function VideoChat() {
         }
       }
     } finally {
-      iceFlushRef.current = false;
+      if (iceFlushRef.current === generation) iceFlushRef.current = false;
     }
   };
 
-  const buildPc = (matchId, attempt = S.current.retry) => {
+  const buildPc = (matchId, attempt = S.current.retry, generation = S.current.generation) => {
+    if (!isCurrentSession(matchId, generation)) return null;
     if (connectionTimerRef.current) clearTimeout(connectionTimerRef.current);
     connectionTimerRef.current = null;
     offerInFlightRef.current = null;
@@ -247,8 +349,13 @@ export default function VideoChat() {
     }
     const pc = makePeerConnection({
       iceServers: S.current.ice || [],
-      onIce: (candidate) => sendWebRtcSignal("webrtc:ice-candidate", { matchId, candidate, attempt }),
+      onIce: (candidate) => {
+        if (isCurrentSession(matchId, generation, pc)) {
+          sendWebRtcSignal("webrtc:ice-candidate", { matchId, candidate, attempt }, generation, pc);
+        }
+      },
       onTrack: (e) => {
+        if (!isCurrentSession(matchId, generation, pc)) return;
         const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
         remoteStreamRef.current = stream;
         const el = videoRef.current;
@@ -261,7 +368,7 @@ export default function VideoChat() {
           });
         }
       },
-      onState: (st) => onPcState(st, pc),
+      onState: (st) => onPcState(st, pc, generation),
       onGathering: () => {},
     });
     pcRef.current = pc;
@@ -278,21 +385,21 @@ export default function VideoChat() {
     }, delay);
   };
 
-  const doOffer = async (matchId) => {
+  const doOffer = async (matchId, generation = S.current.generation) => {
     const pc = pcRef.current;
-    if (!pc) return;
+    if (!pc || !isCurrentSession(matchId, generation, pc)) return;
     if (pc.signalingState !== "stable") return;
     if (offerInFlightRef.current?.pc === pc) return offerInFlightRef.current.promise;
     const attempt = S.current.retry;
     const operation = (async () => {
       const sdp = await createOffer(pc);
-      if (pc !== pcRef.current || matchId !== S.current.matchId || attempt !== S.current.retry) return;
+      if (!isCurrentSession(matchId, generation, pc) || attempt !== S.current.retry) return;
       sendWebRtcSignal("webrtc:offer", {
         matchId,
         sdp: sdp.sdp,
         attempt,
         retry: attempt > 0,
-      });
+      }, generation, pc);
     })();
     const inFlight = { pc, promise: operation };
     offerInFlightRef.current = inFlight;
@@ -307,25 +414,45 @@ export default function VideoChat() {
 
   const beginSession = (matchId, role) => {
     const s = S.current;
+    if (!matchId || !["queued", "starting"].includes(s.phase)) return;
+    if (s.matchId === matchId && s.role === role && pcRef.current) return;
+    teardown(false);
+    const generation = s.generation;
     s.matchId = matchId;
     s.role = role;
     s.retry = 0;
+    if (import.meta.env.DEV) {
+      console.debug("Match session started", {
+        matchId,
+        generation,
+        socketId: rtRef.current?.socket?.id,
+        role,
+      });
+    }
     setRefined(false);
     setExpanded(false);
     setNeedTapAudio(false);
     setMessages((m) => [...m, { system: true, text: "Connected — say hi!" }]);
     setP("connecting");
-    buildPc(matchId);
+    buildPc(matchId, 0, generation);
     matchStartRef.current = Date.now();
-    if (role === "offerer") doOffer(matchId);
+    if (role === "offerer") doOffer(matchId, generation);
   };
 
   const onRemoteOffer = async (d) => {
     const s = S.current;
-    if (!d || d.matchId !== s.matchId) return;
+    if (!d || d.matchId !== s.matchId || !["connecting", "live"].includes(s.phase)) return;
+    const generation = s.generation;
     if (s.role !== "answerer") {
       console.warn("Ignoring offer from the wrong signaling role", { matchId: d.matchId });
       return;
+    }
+    if (import.meta.env.DEV) {
+      console.debug("WebRTC offer received", {
+        matchId: d.matchId,
+        generation: s.generation,
+        socketId: rtRef.current?.socket?.id,
+      });
     }
     const attempt = d.attempt === undefined
       ? d.retry ? Math.min(s.retry + 1, 2) : 0
@@ -337,7 +464,7 @@ export default function VideoChat() {
     if (attempt < s.retry || attempt > 2) return;
     if (attempt > s.retry) {
       s.retry = attempt;
-      buildPc(d.matchId, attempt);
+      buildPc(d.matchId, attempt, generation);
     }
     let pc = pcRef.current;
     if (!pc || pc.remoteDescription?.type === "offer") return;
@@ -349,10 +476,19 @@ export default function VideoChat() {
     remoteOfferInFlightRef.current = pc;
     try {
       await pc.setRemoteDescription({ type: "offer", sdp: d.sdp });
-      await flushIce();
+      if (!isCurrentSession(d.matchId, generation, pc) || attempt !== S.current.retry) return;
+      await flushIce(generation);
+      if (!isCurrentSession(d.matchId, generation, pc) || attempt !== S.current.retry) return;
       const ans = await createAnswer(pc);
-      if (pc === pcRef.current && attempt === S.current.retry) {
-        sendWebRtcSignal("webrtc:answer", { matchId: d.matchId, sdp: ans.sdp, attempt });
+      if (isCurrentSession(d.matchId, generation, pc) && attempt === S.current.retry) {
+        if (import.meta.env.DEV) {
+          console.debug("WebRTC answer generated", {
+            matchId: d.matchId,
+            generation,
+            socketId: rtRef.current?.socket?.id,
+          });
+        }
+        sendWebRtcSignal("webrtc:answer", { matchId: d.matchId, sdp: ans.sdp, attempt }, generation, pc);
       }
     } catch (e) {
       console.warn("offer handling failed", e);
@@ -363,7 +499,8 @@ export default function VideoChat() {
 
   const onRemoteAnswer = async (d) => {
     const s = S.current;
-    if (!d || d.matchId !== s.matchId) return;
+    if (!d || d.matchId !== s.matchId || !["connecting", "live"].includes(s.phase)) return;
+    const generation = s.generation;
     if (s.role !== "offerer") {
       console.warn("Ignoring answer from the wrong signaling role", { matchId: d.matchId });
       return;
@@ -385,8 +522,8 @@ export default function VideoChat() {
     }
     try {
       await pc.setRemoteDescription({ type: "answer", sdp: d.sdp });
-      if (pc !== pcRef.current) return;
-      await flushIce();
+      if (!isCurrentSession(d.matchId, generation, pc)) return;
+      await flushIce(generation);
     } catch (e) {
       console.warn("answer handling failed", e);
     }
@@ -394,7 +531,7 @@ export default function VideoChat() {
 
   const onRemoteIce = (d) => {
     const s = S.current;
-    if (!d || d.matchId !== s.matchId || (d.candidate !== null &&
+    if (!d || d.matchId !== s.matchId || !["connecting", "live"].includes(s.phase) || (d.candidate !== null &&
       (!d.candidate || typeof d.candidate !== "object" || typeof d.candidate.candidate !== "string"))) return;
     const attempt = d.attempt === undefined ? s.retry : d.attempt;
     if (!Number.isInteger(attempt)) {
@@ -403,12 +540,12 @@ export default function VideoChat() {
     }
     if (attempt < s.retry || attempt > 2) return;
     pendingIceRef.current.push({ candidate: d.candidate, attempt, matchId: d.matchId });
-    flushIce();
+    flushIce(s.generation);
   };
 
-  const onPcState = (st, pc) => {
+  const onPcState = (st, pc, generation = S.current.generation) => {
     const s = S.current;
-    if (pc !== pcRef.current) return; // stale peer connection
+    if (pc !== pcRef.current || generation !== s.generation || !s.matchId) return;
     if (st === "connected" || st === "completed") {
       if (connectionTimerRef.current) clearTimeout(connectionTimerRef.current);
       connectionTimerRef.current = null;
@@ -421,10 +558,10 @@ export default function VideoChat() {
       connectionTimerRef.current = null;
       if (s.role === "offerer" && s.retry < 2) {
         s.retry += 1;
-        buildPc(s.matchId, s.retry);
+        buildPc(s.matchId, s.retry, generation);
         setMessages((m) => [...m, { system: true, text: "Network hiccup — retrying connection…" }]);
         setP("connecting");
-        doOffer(s.matchId);
+        doOffer(s.matchId, generation);
       } else if (s.role === "answerer" && s.retry < 2) {
         armConnectionTimer(pc, 25000, endFailedConnection);
       } else {
@@ -452,6 +589,8 @@ export default function VideoChat() {
       const s = S.current;
       switch (ev) {
         case "match:queued":
+          if (d.generation && d.generation !== s.findGeneration) break;
+          if (s.matchId || ["connecting", "live"].includes(s.phase)) break;
           f.teardown(false);
           setEndReason("");
           setRefined(!!d.refined);
@@ -465,6 +604,8 @@ export default function VideoChat() {
           if (S.current.phase === "queued") setP("idle");
           break;
         case "match:found":
+          if (!d.matchId || (d.generation && d.generation !== s.findGeneration) ||
+            !["queued", "starting"].includes(s.phase)) break;
           f.beginSession(d.matchId, d.role);
           break;
         case "match:ended":
@@ -518,7 +659,8 @@ export default function VideoChat() {
       onStatus: (st) => {
         setRtStatus(st);
         if (st !== "live") clearRemoteTyping();
-        if (st === "failed" && S.current.matchId) {
+        if (st !== "live" && (S.current.matchId ||
+          ["starting", "queued", "connecting", "live"].includes(S.current.phase))) {
           H.current.teardown(false);
           setEndReason("disconnected");
           setP("ended");
@@ -567,17 +709,32 @@ export default function VideoChat() {
 
   const start = async () => {
     const s = S.current;
+    if (filterEndPromiseRef.current) {
+      const currentGeneration = s.generation;
+      const response = await filterEndPromiseRef.current;
+      if (currentGeneration !== s.generation) return;
+      filterEndPromiseRef.current = null;
+      if (response?.ok !== true) {
+        showToast("Could not end the current search. Please try again.");
+        return;
+      }
+    }
     if (["starting", "queued", "connecting", "live"].includes(s.phase)) return;
     if (!rtRef.current || !rtRef.current.online) {
       showToast("Waiting for server connection…");
       return;
     }
+    const generation = ++s.generation;
+    s.findGeneration = null;
     setP("starting");
     setErrorInfo(null);
     setEndReason("");
     try {
-      s.ice = await getIceServers();
+      const ice = await getIceServers();
+      if (generation !== s.generation || s.phase !== "starting") return;
+      s.ice = ice;
     } catch (error) {
+      if (generation !== s.generation || s.phase !== "starting") return;
       setErrorInfo({
         code: "ice-config",
         title: "Video network setup unavailable",
@@ -594,46 +751,84 @@ export default function VideoChat() {
     try {
       if (!localStreamRef.current) {
         const stream = await getMedia();
+        if (generation !== s.generation || s.phase !== "starting") {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
         localStreamRef.current = stream;
         const lel = localRef.current;
         if (lel) {
           lel.srcObject = stream;
           lel.play().catch(() => {});
         }
-        setCameras(await listCameras());
+        const availableCameras = await listCameras();
+        if (generation !== s.generation || s.phase !== "starting") return;
+        setCameras(availableCameras);
         setCamIdx(0);
       }
     } catch (err) {
+      if (generation !== s.generation || s.phase !== "starting") return;
       setErrorInfo(mediaError(err));
       setP("error");
       return;
     }
-    setP("queued");
-    rtRef.current.send("match:find", toFindPayload("video", prefs));
+    queueWithPrefs(prefs);
   };
 
-  const next = () => {
+  const next = async () => {
     const s = S.current;
     if (!rtRef.current || !rtRef.current.online) return;
-    if (s.phase === "queued") {
-      rtRef.current.send("match:cancel");
+    if (nextInFlightRef.current) return;
+    if (s.phase === "starting") {
+      if (s.matchId) return;
+      teardown(false);
+      s.findGeneration = null;
       setP("idle");
       return;
     }
-    if (s.matchId) rtRef.current.send("match:next", { matchId: s.matchId });
-    teardown(false);
-    setMessages([]);
-    setEndReason("");
-    setNeedTapAudio(false);
-    setP("queued");
-    rtRef.current.send("match:find", toFindPayload("video", prefs));
+    if (s.phase === "queued") {
+      const request = rtRef.current.sendWithAck("match:cancel");
+      teardown(false);
+      s.findGeneration = null;
+      setP("idle");
+      const response = await request;
+      if (response?.ok === false) showToast("Could not cancel matchmaking. Please try again.");
+      return;
+    }
+    nextInFlightRef.current = true;
+    try {
+      if (s.matchId) {
+        const matchId = s.matchId;
+        const request = rtRef.current.sendWithAck("match:next", { matchId });
+        teardown(false);
+        s.findGeneration = null;
+        setP("starting");
+        const transitionGeneration = s.generation;
+        const response = await request;
+        if (transitionGeneration !== s.generation || s.phase !== "starting") return;
+        if (response?.ok !== true) {
+          setP("ended");
+          showToast("Could not end the current match. Please try again.");
+          return;
+        }
+      }
+      setMessages([]);
+      setEndReason("");
+      setNeedTapAudio(false);
+      queueWithPrefs(prefs);
+    } finally {
+      nextInFlightRef.current = false;
+    }
   };
 
   const stop = () => {
     const s = S.current;
-    if (s.phase === "queued") rtRef.current && rtRef.current.send("match:cancel");
-    else if (s.matchId) rtRef.current && rtRef.current.send("match:stop", { matchId: s.matchId });
+    const matchId = s.matchId;
+    if (s.phase === "queued") rtRef.current?.send("match:cancel");
+    else if (matchId) rtRef.current?.send("match:stop", { matchId });
     teardown(true);
+    s.findGeneration = null;
+    nextInFlightRef.current = false;
     setMessages([]);
     setEndReason("");
     setNeedTapAudio(false);
@@ -932,12 +1127,15 @@ export default function VideoChat() {
         prefs={prefs}
         onOpen={() => {
           // pause any current match/queue so the user is configuring, not chatting
-          if (S.current.state === "queued") {
-            rtRef.current?.send("match:cancel");
-            setP("idle");
-          } else if (S.current.state === "matched" || S.current.state === "connecting") {
-            if (S.current.matchId) rtRef.current?.send("match:next", { matchId: S.current.matchId });
+          if (S.current.phase === "queued") {
+            filterEndPromiseRef.current = rtRef.current?.sendWithAck("match:cancel");
             teardown(false);
+            S.current.findGeneration = null;
+            setP("idle");
+          } else if (S.current.matchId && ["connecting", "live"].includes(S.current.phase)) {
+            filterEndPromiseRef.current = rtRef.current?.sendWithAck("match:next", { matchId: S.current.matchId });
+            teardown(false);
+            S.current.findGeneration = null;
             setP("idle");
           }
         }}

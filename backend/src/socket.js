@@ -50,8 +50,12 @@ export function attachSockets(io, { matchmaker, moderation, store, cfg, log, roo
       matchmaker.onDisconnect(socket.id);
       try {
         const room = await rooms?.detach(socket.id);
+        if (room && !cfg.isProd) {
+          log.debug("private room cleanup", { roomId: room.roomId, socket: socket.id });
+        }
         if (room?.roomClosed) {
           io.to(`room:${room.roomId}`).emit("room:closed", { roomId: room.roomId, reason: "empty" });
+          await sfu?.cleanupRoom(room.roomId);
         } else if (room?.members) {
           sfu.broadcastPeers(room.roomId, room.members.host, room.members.members);
         }
@@ -64,13 +68,18 @@ export function attachSockets(io, { matchmaker, moderation, store, cfg, log, roo
     /** Uniform handler wrapper: validates, runs, reports errors without crashing. */
     const wrap = (event, handler) => {
       socket.on(event, (data, ack) => {
+        const eventData = data && typeof data === "object" ? data : {};
+        if (event.startsWith("webrtc:") &&
+          Object.prototype.hasOwnProperty.call(eventData, "roomId")) {
+          return; // Private-room signaling is handled by the room-authorized relay.
+        }
         const process = async () => {
         // Always ack (success or failure) so client emitters never hang.
         const done = (payload) => {
           if (typeof ack === "function") ack(payload);
         };
         try {
-          const res = await handler(data && typeof data === "object" ? data : {});
+          const res = await handler(eventData);
           const payload = res && typeof res === "object" ? res : { ok: true };
           socket.emit(`${event}:ok`, payload);
           done(payload);
@@ -107,7 +116,8 @@ export function attachSockets(io, { matchmaker, moderation, store, cfg, log, roo
       const mode = d.mode;
       if (mode !== "video" && mode !== "text") throw new MatchError("bad-mode", "mode must be 'video' or 'text'");
       // Filters are fully optional — missing prefs = standard random matchmaking.
-      return matchmaker.find(socket.id, mode, sanitizePrefs(d.prefs));
+      const generation = d.generation === undefined ? null : d.generation;
+      return matchmaker.find(socket.id, mode, sanitizePrefs(d.prefs), generation);
     });
     wrap("match:expand", async () => matchmaker.expand(socket.id));
     wrap("match:cancel", async () => matchmaker.cancel(socket.id));
@@ -320,8 +330,9 @@ export function attachSockets(io, { matchmaker, moderation, store, cfg, log, roo
         const roomId = d?.roomId;
         const targetSocketId = d?.socketId;
         if (!roomId || !targetSocketId) throw new MatchError("missing-params");
-        return rooms.removeMember({ hostSocketId: socket.id, roomId, targetSocketId }).then((r) => {
+        return rooms.removeMember({ hostSocketId: socket.id, roomId, targetSocketId }).then(async (r) => {
           if (!r.ok) throw new MatchError(r.error || "remove-failed");
+          await sfu.forgetPeer(roomId, targetSocketId);
           io.to(targetSocketId).emit("room:removed", { roomId, reason: "removed-by-host" });
           sfu.announceLeave(roomId, targetSocketId, "removed-by-host");
           sfu.broadcastPeers(roomId, r.members.host, r.members.members);
@@ -332,11 +343,12 @@ export function attachSockets(io, { matchmaker, moderation, store, cfg, log, roo
       wrap("room:close", (d) => {
         const roomId = d?.roomId;
         if (!roomId) throw new MatchError("missing-params");
-        return store.roomGetMembers(roomId).then((m) => {
+        return store.roomGetMembers(roomId).then(async (m) => {
           if (!m) return { ok: true, alreadyClosed: true };
           if (m.host !== socket.id) throw new MatchError("not-host");
           io.to(`room:${roomId}`).emit("room:closed", { roomId, reason: "host-closed" });
           sfu.announceClosed(roomId, "host-closed");
+          await sfu.cleanupRoom(roomId);
           return store.roomDelMeta(roomId).then(() => ({ ok: true }));
         });
       });

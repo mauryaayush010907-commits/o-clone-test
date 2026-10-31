@@ -63,11 +63,80 @@ export function attachSFU({ io, rooms, log, cfg }) {
     sessionByRoom.get(s.roomId)?.delete(socketId);
     return s;
   }
+  async function forgetPeer(roomId, socketId) {
+    const session = getSession(socketId);
+    if (!session || session.roomId !== roomId) return false;
+    leaveSession(socketId);
+    const socket = io.sockets.sockets.get(socketId);
+    if (socket) await socket.leave(roomName(roomId));
+    return true;
+  }
+  async function cleanupRoom(roomId) {
+    for (const socketId of roomMembers(roomId)) await forgetPeer(roomId, socketId);
+  }
   function getSession(socketId) {
     return sessionBySocket.get(socketId) || null;
   }
   function roomMembers(roomId) {
     return [...(sessionByRoom.get(roomId) || [])];
+  }
+  const roomName = (roomId) => ROOM_NAMESPACE_PREFIX + roomId;
+
+  async function isActiveMember(socketId, roomId) {
+    const session = getSession(socketId);
+    const connectedSocket = io.sockets.sockets.get(socketId);
+    if (!session || session.roomId !== roomId || !connectedSocket?.connected ||
+      !connectedSocket.rooms.has(roomName(roomId))) {
+      return false;
+    }
+    const members = await (cfg.storeRef ? cfg.storeRef() : null)?.roomGetMembers?.(roomId);
+    return !!members?.members.has(socketId);
+  }
+
+  async function isActiveRecipient(socketId, roomId) {
+    const members = await (cfg.storeRef ? cfg.storeRef() : null)?.roomGetMembers?.(roomId);
+    if (!members?.members.has(socketId)) return false;
+    const sockets = await io.in(socketId).fetchSockets();
+    if (!sockets.some((remoteSocket) => remoteSocket.rooms.has(roomName(roomId)))) return false;
+    const currentMembers = await (cfg.storeRef ? cfg.storeRef() : null)?.roomGetMembers?.(roomId);
+    return !!currentMembers?.members.has(socketId);
+  }
+
+  async function relay(event, socket, roomId, to, payload, ack) {
+    if (typeof roomId !== "string" || !roomId || roomId.length > 64 ||
+      typeof to !== "string" || !to || to === socket.id) {
+      return ack?.({ ok: false, error: "bad-room-or-peer" });
+    }
+    try {
+    if (!await isActiveMember(socket.id, roomId)) {
+      log.debug("private WebRTC signal rejected", {
+        event, roomId, socket: socket.id, to, code: "not-in-room",
+      });
+      return ack?.({ ok: false, error: "not-in-room" });
+    }
+    if (!await isActiveRecipient(to, roomId)) {
+      log.debug("private WebRTC signal rejected", {
+        event, roomId, socket: socket.id, to, code: "peer-not-in-room",
+      });
+      return ack?.({ ok: false, error: "peer-not-in-room" });
+    }
+    if (!await isActiveMember(socket.id, roomId)) {
+      log.debug("private WebRTC signal rejected", {
+        event, roomId, socket: socket.id, to, code: "not-in-room",
+      });
+      return ack?.({ ok: false, error: "not-in-room" });
+    }
+    io.to(to).emit(event, { from: socket.id, roomId, ...payload });
+    ack?.({ ok: true });
+    if (!cfg.isProd) {
+      log.debug("private WebRTC signal forwarded", { event, roomId, socket: socket.id, to });
+    }
+    } catch (error) {
+      log.warn("private WebRTC relay failed", {
+        event, roomId, socket: socket.id, to, err: error.message,
+      });
+      ack?.({ ok: false, error: "internal" });
+    }
   }
 
   // ----- Join a private room (Socket.IO) -----
@@ -76,14 +145,25 @@ export function attachSFU({ io, rooms, log, cfg }) {
   io.on("connection", (socket) => {
     socket.on("room:join", async ({ roomId, isHost }, ack) => {
       try {
-        const m = await (cfg.storeRef ? cfg.storeRef() : null)?.roomGetMembers?.(roomId);
+        let m = await (cfg.storeRef ? cfg.storeRef() : null)?.roomGetMembers?.(roomId);
         if (!m) return ack?.({ ok: false, error: "not-found" });
         if (isHost && m.host !== socket.id) return ack?.({ ok: false, error: "not-host" });
         if (!isHost && !m.members.has(socket.id)) {
           return ack?.({ ok: false, error: "not-a-member" });
         }
-        // Add to the per-room namespace so signaling is scoped.
-        socket.join(ROOM_NAMESPACE_PREFIX + roomId);
+        const existing = getSession(socket.id);
+        if (existing && existing.roomId !== roomId) {
+          return ack?.({ ok: false, error: "already-in-room" });
+        }
+        const alreadyJoined = existing?.roomId === roomId && socket.rooms.has(roomName(roomId));
+        // Do not acknowledge the room until the adapter has registered it.
+        await socket.join(roomName(roomId));
+        m = await (cfg.storeRef ? cfg.storeRef() : null)?.roomGetMembers?.(roomId);
+        const stillAuthorized = isHost ? m?.host === socket.id : m?.members.has(socket.id);
+        if (!socket.connected || !stillAuthorized) {
+          await socket.leave(roomName(roomId));
+          return ack?.({ ok: false, error: "not-a-member" });
+        }
         joinSession(socket.id, roomId, isHost);
         // Tell the joiner who else is in the room.
         const others = [];
@@ -92,12 +172,17 @@ export function attachSFU({ io, rooms, log, cfg }) {
           others.push({ socketId: sid, username: entry.username, isHost: !!entry.isHost });
         }
         // Tell the others about the new joiner.
-        socket.to(ROOM_NAMESPACE_PREFIX + roomId).emit("room:peer-joined", {
-          roomId,
-          socketId: socket.id,
-          username: socket.data?.username || null,
-          isHost,
-        });
+        if (!alreadyJoined) {
+          socket.to(roomName(roomId)).emit("room:peer-joined", {
+            roomId,
+            socketId: socket.id,
+            username: socket.data?.username || null,
+            isHost,
+          });
+        }
+        if (!cfg.isProd) {
+          log.debug("private room join completed", { roomId, socket: socket.id, isHost });
+        }
         ack?.({ ok: true, self: { socketId: socket.id, isHost }, others, host: m.host });
       } catch (e) {
         log.warn("room:join failed", { err: e.message });
@@ -106,48 +191,32 @@ export function attachSFU({ io, rooms, log, cfg }) {
     });
 
     // ----- Signaling relay (mesh) -----
-    socket.on("webrtc:offer", ({ to, sdp, roomId }, ack) => {
-      const s = getSession(socket.id);
-      if (!s || s.roomId !== roomId) return ack?.({ ok: false, error: "not-in-room" });
+    socket.on("webrtc:offer", async ({ to, sdp, roomId } = {}, ack) => {
       if (typeof sdp !== "string" || sdp.length === 0 || sdp.length > SDP_MAX) {
         return ack?.({ ok: false, error: "bad-sdp" });
       }
-      const peer = (sessionByRoom.get(roomId) || new Set()).has(to);
-      if (!peer) return ack?.({ ok: false, error: "peer-not-in-room" });
-      io.to(to).emit("webrtc:offer", { from: socket.id, roomId, sdp });
-      ack?.({ ok: true });
+      await relay("webrtc:offer", socket, roomId, to, { sdp }, ack);
     });
-    socket.on("webrtc:answer", ({ to, sdp, roomId }, ack) => {
-      const s = getSession(socket.id);
-      if (!s || s.roomId !== roomId) return ack?.({ ok: false, error: "not-in-room" });
+    socket.on("webrtc:answer", async ({ to, sdp, roomId } = {}, ack) => {
       if (typeof sdp !== "string" || sdp.length === 0 || sdp.length > SDP_MAX) {
         return ack?.({ ok: false, error: "bad-sdp" });
       }
-      const peer = (sessionByRoom.get(roomId) || new Set()).has(to);
-      if (!peer) return ack?.({ ok: false, error: "peer-not-in-room" });
-      io.to(to).emit("webrtc:answer", { from: socket.id, roomId, sdp });
-      ack?.({ ok: true });
+      await relay("webrtc:answer", socket, roomId, to, { sdp }, ack);
     });
-    socket.on("webrtc:ice", ({ to, candidate, roomId }, ack) => {
-      const s = getSession(socket.id);
-      if (!s || s.roomId !== roomId) return ack?.({ ok: false, error: "not-in-room" });
+    socket.on("webrtc:ice", async ({ to, candidate, roomId } = {}, ack) => {
       if (!candidate || typeof candidate !== "object" || JSON.stringify(candidate).length > ICE_MAX) {
         return ack?.({ ok: false, error: "bad-ice" });
       }
-      const peer = (sessionByRoom.get(roomId) || new Set()).has(to);
-      if (!peer) return ack?.({ ok: false, error: "peer-not-in-room" });
-      io.to(to).emit("webrtc:ice", { from: socket.id, roomId, candidate });
-      ack?.({ ok: true });
+      await relay("webrtc:ice", socket, roomId, to, { candidate }, ack);
     });
 
     // ----- In-room chat -----
-    socket.on("room:chat", ({ roomId, text }, ack) => {
-      const s = getSession(socket.id);
-      if (!s || s.roomId !== roomId) return ack?.({ ok: false, error: "not-in-room" });
+    socket.on("room:chat", async ({ roomId, text } = {}, ack) => {
+      if (!await isActiveMember(socket.id, roomId)) return ack?.({ ok: false, error: "not-in-room" });
       const t = String(text || "").trim();
       if (!t || t.length > 500) return ack?.({ ok: false, error: "bad-message" });
       const username = socket.data?.username || "anon";
-      io.to(ROOM_NAMESPACE_PREFIX + roomId).emit("room:chat", {
+      io.to(roomName(roomId)).emit("room:chat", {
         from: socket.id,
         username,
         text: t,
@@ -157,10 +226,9 @@ export function attachSFU({ io, rooms, log, cfg }) {
     });
 
     // ----- Status: mic / cam toggles (broadcast to peers) -----
-    socket.on("room:status", ({ roomId, mic, cam }, ack) => {
-      const s = getSession(socket.id);
-      if (!s || s.roomId !== roomId) return ack?.({ ok: false, error: "not-in-room" });
-      socket.to(ROOM_NAMESPACE_PREFIX + roomId).emit("room:status", {
+    socket.on("room:status", async ({ roomId, mic, cam } = {}, ack) => {
+      if (!await isActiveMember(socket.id, roomId)) return ack?.({ ok: false, error: "not-in-room" });
+      socket.to(roomName(roomId)).emit("room:status", {
         from: socket.id,
         mic: !!mic,
         cam: !!cam,
@@ -170,14 +238,21 @@ export function attachSFU({ io, rooms, log, cfg }) {
     });
 
     // ----- Explicit leave (also called automatically on disconnect) -----
-    socket.on("room:leave", (_, ack) => {
+    socket.on("room:leave", async (_, ack) => {
       const s = leaveSession(socket.id);
       if (s) {
-        socket.leave(ROOM_NAMESPACE_PREFIX + s.roomId);
-        socket.to(ROOM_NAMESPACE_PREFIX + s.roomId).emit("room:peer-left", {
+        await socket.leave(roomName(s.roomId));
+        socket.to(roomName(s.roomId)).emit("room:peer-left", {
           roomId: s.roomId,
           socketId: socket.id,
         });
+        const room = await rooms?.detach(socket.id);
+        if (room?.roomClosed) {
+          io.to(roomName(s.roomId)).emit("room:closed", { roomId: s.roomId, reason: "empty" });
+          await cleanupRoom(s.roomId);
+        } else if (room?.members) {
+          broadcastPeers(s.roomId, room.members.host, room.members.members);
+        }
       }
       ack?.({ ok: true });
     });
@@ -190,6 +265,9 @@ export function attachSFU({ io, rooms, log, cfg }) {
         socketId: socket.id,
         reason: "disconnected",
       });
+      if (s && !cfg.isProd) {
+        log.debug("private room signaling cleanup", { roomId: s.roomId, socket: socket.id });
+      }
     });
   });
 
@@ -216,7 +294,16 @@ export function attachSFU({ io, rooms, log, cfg }) {
     io.to(ROOM_NAMESPACE_PREFIX + roomId).emit("room:closed", { roomId, reason });
   }
 
-  return { broadcastPeers, announceLeave, announceClosed, getSession, roomMembers, ROOM_NAMESPACE_PREFIX };
+  return {
+    broadcastPeers,
+    announceLeave,
+    announceClosed,
+    cleanupRoom,
+    forgetPeer,
+    getSession,
+    roomMembers,
+    ROOM_NAMESPACE_PREFIX,
+  };
 }
 
 // (Normalization helpers live in rooms.js; tests import them from there.)

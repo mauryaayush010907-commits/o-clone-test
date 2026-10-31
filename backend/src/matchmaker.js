@@ -47,13 +47,27 @@ export function createMatchmaker({ store, io, log, cfg }) {
   const rec = (socketId, create = false) => {
     let r = recs.get(socketId);
     if (!r && create) {
-      r = { state: "idle", mode: null, matchId: null, queueTs: 0, lastFind: 0, prefs: emptyPrefs(), expanded: false, expandTimer: null };
+      r = {
+        state: "idle",
+        mode: null,
+        matchId: null,
+        queueTs: 0,
+        finding: false,
+        lastFind: 0,
+        prefs: emptyPrefs(),
+        expanded: false,
+        generation: null,
+        expandTimer: null,
+      };
       recs.set(socketId, r);
     }
     return r;
   };
 
-  const alive = (socketId) => io.sockets.sockets.has(socketId);
+  const alive = async (socketId) => {
+    if (typeof io.in === "function") return (await io.in(socketId).fetchSockets()).length > 0;
+    return io.sockets.sockets.has(socketId);
+  };
   const effFilters = (prefs, expanded) => (expanded ? EMPTY_FILTERS : filtersOf(prefs));
 
   function clearExpandTimer(r) {
@@ -76,10 +90,10 @@ export function createMatchmaker({ store, io, log, cfg }) {
     const ids = await store.queuePeek(mode, SCAN_LIMIT);
     for (const id of ids) {
       if (id === socketId) continue;
-      if (!alive(id)) continue; // stale: already disconnected
+      if (!await alive(id)) continue; // stale: already disconnected
       const orec = rec(id);
-      if (!orec || orec.state !== "queued") continue; // state drift
-      const w = (await store.prefsGet(id)) || { prefs: emptyPrefs(), expanded: false };
+      const w = await store.prefsGet(id);
+      if (!w || (orec && orec.state !== "queued")) continue; // state drift / missing queued session
       const wF = effFilters(w.prefs, w.expanded);
       const wP = profileOf(w.prefs);
       if (!pairCompatible(meF, meP, wF, wP)) continue; // explicit filters not (mutually) satisfied yet
@@ -88,33 +102,65 @@ export function createMatchmaker({ store, io, log, cfg }) {
       if (!claimed || claimed.id !== id) continue; // lost the race — try the next waiter
 
       const matchId = genId();
-      await store.matchSet(matchId, { a: id, b: socketId, mode, ts: Date.now() }, cfg.sessionTtlMs);
+      await store.matchSet(matchId, {
+        a: id,
+        b: socketId,
+        mode,
+        ts: Date.now(),
+        aGeneration: w.generation,
+        bGeneration: s.generation,
+      }, cfg.sessionTtlMs);
       clearExpandTimer(orec);
-      orec.state = "matched";
-      orec.matchId = matchId;
-      const s = rec(socketId);
+      if (orec) {
+        orec.state = "matched";
+        orec.matchId = matchId;
+      }
       if (s) {
         clearExpandTimer(s);
         s.state = "matched";
         s.matchId = matchId;
+        s.finding = false;
       }
       store.prefsDel(id).catch(() => {});
       store.prefsDel(socketId).catch(() => {});
 
       // The longest-waiting user becomes the offerer (deterministic → no offer glare).
-      io.to(id).emit("match:found", { matchId, role: "offerer", mode });
-      io.to(socketId).emit("match:found", { matchId, role: "answerer", mode });
+      io.to(id).emit("match:found", { matchId, role: "offerer", mode, generation: w.generation || null });
+      io.to(socketId).emit("match:found", { matchId, role: "answerer", mode, generation: s?.generation || null });
       log.info("match made", { matchId, mode, refined: activeCount(w.prefs) > 0 || (s && activeCount(s.prefs) > 0) });
       return matchId;
     }
     return null;
   }
 
-  async function find(socketId, mode, rawPrefs) {
+  async function find(socketId, mode, rawPrefs, generation = null) {
     if (!MODES.includes(mode)) throw new MatchError("bad-mode", "mode must be 'video' or 'text'");
     const s = rec(socketId, true);
-    if (s.state === "matched") throw new MatchError("already-matched", "You are already in a conversation. Use Next first.");
-    if (s.state === "queued") return { queued: true }; // duplicate request — deduped
+    if (generation !== null && (typeof generation !== "string" || !generation || generation.length > 64)) {
+      throw new MatchError("bad-generation", "match generation must be a non-empty string of at most 64 characters");
+    }
+    const activeMatchId = await store.matchForSocket(socketId);
+    if (activeMatchId) {
+      s.state = "matched";
+      s.matchId = activeMatchId;
+      throw new MatchError("already-matched", "You are already in a conversation. Use Next first.");
+    }
+    if (s.state === "matched") {
+      s.state = "idle";
+      s.matchId = null;
+      s.mode = null;
+      s.finding = false;
+    }
+    if (s.state === "queued") {
+      if (s.finding) return { queued: true };
+      const queuedIds = s.mode ? await store.queuePeek(s.mode) : [];
+      if (queuedIds.includes(socketId)) return { queued: true }; // duplicate request — deduped
+      clearExpandTimer(s);
+      s.state = "idle";
+      s.mode = null;
+      s.matchId = null;
+      s.queueTs = 0;
+    }
     const now = Date.now();
     if (now - s.lastFind < cfg.findCooldownMs) throw new MatchError("too-fast", "Slow down — you are requesting matches too quickly.");
 
@@ -122,10 +168,12 @@ export function createMatchmaker({ store, io, log, cfg }) {
     s.lastFind = now;
     s.state = "queued";
     s.mode = mode;
+    s.finding = true;
     s.prefs = prefs;
     s.expanded = false;
+    s.generation = generation;
     clearExpandTimer(s);
-    await store.prefsSet(socketId, { prefs, expanded: false }, cfg.sessionTtlMs);
+    await store.prefsSet(socketId, { prefs, expanded: false, generation }, cfg.sessionTtlMs);
 
     // Unfiltered users keep legacy behavior: pair with the oldest waiter instantly.
     // Filtered users pair only when mutually compatible.
@@ -134,9 +182,10 @@ export function createMatchmaker({ store, io, log, cfg }) {
 
     await store.queuePush(mode, socketId, now);
     s.queueTs = now;
+    s.finding = false;
     const refined = activeCount(prefs) > 0;
     const position = await store.queueLength(mode);
-    io.to(socketId).emit("match:queued", { mode, position, refined });
+    io.to(socketId).emit("match:queued", { mode, position, refined, generation });
 
     if (refined) {
       // Visible auto-expansion after patience — never a silent fallback.
@@ -162,7 +211,11 @@ export function createMatchmaker({ store, io, log, cfg }) {
     s.expanded = true;
     clearExpandTimer(s);
     const stored = (await store.prefsGet(socketId)) || { prefs: s.prefs || emptyPrefs(), expanded: false };
-    await store.prefsSet(socketId, { prefs: stored.prefs, expanded: true }, cfg.sessionTtlMs);
+    await store.prefsSet(socketId, {
+      prefs: stored.prefs,
+      expanded: true,
+      generation: stored.generation,
+    }, cfg.sessionTtlMs);
     io.to(socketId).emit("match:expanding", { mode: s.mode });
     const matchId = await findPair(socketId, s.mode);
     if (matchId) return { ok: true, expanded: true, matched: matchId };
@@ -178,6 +231,7 @@ export function createMatchmaker({ store, io, log, cfg }) {
     s.state = "idle";
     s.mode = null;
     s.expanded = false;
+    s.finding = false;
     io.to(socketId).emit("match:cancelled", {});
     return { ok: true };
   }
@@ -194,6 +248,7 @@ export function createMatchmaker({ store, io, log, cfg }) {
           r.state = "idle";
           r.matchId = null;
           r.expanded = false;
+          r.finding = false;
           r.lastFind = 0; // allow immediate re-queue after Next
         }
       }
@@ -240,15 +295,20 @@ export function createMatchmaker({ store, io, log, cfg }) {
   function onDisconnect(socketId) {
     const s = recs.get(socketId);
     recs.delete(socketId);
-    if (!s) return;
-    clearExpandTimer(s);
-    if (s.state === "queued" && s.mode) {
-      store.queueRemove(s.mode, socketId).catch((e) => log.warn("queueRemove on disconnect failed", { err: e.message }));
+    if (s) clearExpandTimer(s);
+    if (s?.state === "queued" && s.mode) {
+      store.queueRemove(s.mode, socketId).catch((e) =>
+        log.warn("queueRemove on disconnect failed", { socket: socketId, err: e.message })
+      );
     }
-    store.prefsDel(socketId).catch(() => {});
-    if (s.state === "matched" && s.matchId) {
-      endMatch(s.matchId, "disconnected").catch((e) => log.warn("endMatch on disconnect failed", { err: e.message }));
-    }
+    (async () => {
+      const activeMatchId = await store.matchForSocket(socketId);
+      if (activeMatchId) {
+        await endMatch(activeMatchId, "disconnected");
+        return;
+      }
+      await store.prefsDel(socketId);
+    })().catch((e) => log.warn("socket disconnect cleanup failed", { socket: socketId, err: e.message }));
   }
 
   /** Periodic cleanup: stale queue entries, orphaned matches, dead recs. */

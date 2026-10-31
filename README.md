@@ -36,13 +36,17 @@ stranger-chat/
 - **Matchmaking is Redis-backed.** Queues are Redis lists; `LPOP` is atomic, so multiple backend instances can never double-match the same waiter. The `socket.io-redis-adapter` broadcasts events across instances.
 - **Sessions have TTLs** in Redis; a periodic sweeper removes stale queue entries and orphaned match state.
 - **Deterministic negotiation.** The longest-waiting user is always the *offerer* — no offer glare. ICE candidates arriving before the remote description are buffered client-side and flushed after `setRemoteDescription`. On ICE failure the offerer retries up to 2× with a fresh peer connection.
+- **Match lifecycle is generation-scoped.** Each `match:find` carries a client generation echoed by `match:queued`/`match:found`; the server-created `matchId` is the authoritative signaling session ID. Next, Stop, and disconnect invalidate pending WebRTC work, and rejected signals are not automatically resent.
+- **Private rooms have a separate authorization path.** A `room:join` acknowledgement is sent only after Socket.IO room registration and shared-store membership are confirmed. Private offers, answers, and ICE require both connected members to be registered in the same room. Repeated joins are idempotent.
+- **Reconnects do not inherit room authorization.** Socket.IO assigns a new socket ID after reconnect, so the active private-room session is cleared and the user must create or join again. Old async work cannot signal through the replacement socket.
+- **Multi-instance deployments use Redis for room and match state.** The Redis Socket.IO adapter routes events and room-member checks across backend instances; in-memory state is only used for local development.
 
 ## Socket event contract (frontend ⇄ backend)
 
 | Client → Server | Server → Client |
 |---|---|
-| `match:find {mode:"video"\|"text", prefs?}` (prefs optional) | `match:queued {mode, position, refined}` |
-| `match:expand` (widen a refined search now) | `match:found {matchId, role:"offerer"\|"answerer", mode}` |
+| `match:find {mode:"video"\|"text", prefs?, generation?}` (prefs optional) | `match:queued {mode, position, refined, generation?}` |
+| `match:expand` (widen a refined search now) | `match:found {matchId, role:"offerer"\|"answerer", mode, generation?}` |
 | `match:cancel` | `match:expanding {mode}` (visible auto/manual expansion) |
 | `match:next {matchId}` | `match:cancelled` |
 | `match:stop {matchId}` | `match:ended {matchId, reason:"next"\|"stopped"\|"disconnected"}` |
@@ -86,10 +90,14 @@ npm run dev
 #    (or two browsers on the same machine), both on http://<host>:5173
 ```
 
-Run the backend test suite (matchmaker + full signaling over real sockets):
+Run the backend test suite (matchmaker, cross-instance state behavior, private-room authorization/reconnect, stale signaling, and real Socket.IO signaling):
 
 ```bash
-cd backend && npm test
+cd backend
+npm test
+
+cd ../frontend
+npm run build
 ```
 
 ## Environment variables
@@ -100,7 +108,7 @@ cd backend && npm test
 |---|---|
 | `PORT`, `HOST` | Listen address (default `0.0.0.0:10000`) |
 | `FRONTEND_URL` | Comma-separated CORS origins (required in production) |
-| `REDIS_URL` | e.g. `redis://redis:6379` — **required for production** (atomic matchmaking) |
+| `REDIS_URL` | e.g. `redis://redis:6379` — **required for production** (shared matchmaking, private-room membership, usernames, and Socket.IO adapter) |
 | `MONGODB_URI` | e.g. `mongodb://mongodb:27017/drift` — **required for production** (reports/bans) |
 | `STUN_URLS` | Extra STUN servers (Google STUN always included) |
 | `TURN_URLS` | Preferred: exact comma-separated, provider-supported TURN URIs (e.g. `turn:turn.example.com:3478`); legacy `TURN_URL` remains supported, and a scheme-prefixed URI also gets its TCP variant |
@@ -241,7 +249,7 @@ node -e "const{io}=require('socket.io-client');const s=io('https://drift-api.onr
 
 ### Scaling out
 
-- Run N backend instances behind a load balancer with sticky sessions **off** — state lives in Redis (queues, matches, counters) and the Socket.IO Redis adapter relays events. No per-instance state is authoritative.
+- Run N backend instances behind a load balancer with sticky sessions **off** — state lives in Redis (queues, matches, private-room membership, usernames, counters) and the Socket.IO Redis adapter relays events and resolves active room members. Each instance keeps only the authorization cache for its own connected sockets.
 - MongoDB Atlas M0 + a small Redis (1GB) comfortably support thousands of concurrent conversations; the bottleneck in stranger chat is TURN media, not signaling.
 
 #### nginx example (for VPS or behind Render Frontend/CDN)
@@ -315,7 +323,7 @@ curl -H "x-admin-key: $ADMIN_API_KEY" https://api.drift.example.com/api/admin/st
 
 | Area | Status |
 |---|---|
-| Backend test suite (matchmaker semantics, race safety, signaling relay, authz, rate limits, validation) | ✅ 23/23 passing (`cd backend && npm test`) |
+| Backend test suite (matchmaker semantics, race safety, signaling relay, authz, rate limits, validation) | ✅ 67/67 passing (`cd backend && npm test`; Redis-backed integration requires a configured Redis service) |
 | Frontend production build (Vite) | ✅ compiles clean |
 | Sandbox preview build (root Next.js harness, real-time + Postgres reports) | ✅ builds & healthcheck passing |
 | Live two-device video over the internet | ⚠️ Requires your deployment + TURN for symmetric NATs — follow the real call checklist |

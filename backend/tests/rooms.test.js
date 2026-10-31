@@ -202,11 +202,21 @@ describe("private rooms", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(peerJoinedEvents).toHaveLength(0);
 
+    const notRegistered = await emit(guest, "webrtc:answer", {
+      roomId: created.roomId,
+      to: host.id,
+      sdp: "v=0\nanswer-before-room-join",
+    });
+    expect(notRegistered).toMatchObject({ ok: false, error: "not-in-room" });
+
     const peerJoinedP = waitFor(host, "room:peer-joined");
     const guestJoined = await emit(guest, "room:join", { roomId: created.roomId, isHost: false });
     expect(guestJoined.ok).toBe(true);
     expect(guestJoined.others).toContainEqual(expect.objectContaining({ socketId: host.id, isHost: true }));
     expect(await peerJoinedP).toMatchObject({ socketId: guest.id, roomId: created.roomId });
+    await emit(guest, "room:join", { roomId: created.roomId, isHost: false });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(peerJoinedEvents).toHaveLength(1);
 
     const deliveredMessage = waitFor(host, "room:chat");
     const chatAck = await emit(guest, "room:chat", { roomId: created.roomId, text: "private room hello" });
@@ -219,6 +229,7 @@ describe("private rooms", () => {
       to: guest.id,
       candidate: { candidate: "candidate:test", sdpMid: "0", sdpMLineIndex: 0 },
     });
+
     expect(candidateAck.ok).toBe(true);
     expect(await deliveredCandidate).toMatchObject({
       from: host.id,
@@ -226,8 +237,110 @@ describe("private rooms", () => {
       candidate: { candidate: "candidate:test" },
     });
 
+    const offers = [];
+    const answers = [];
+    host.on("webrtc:offer", (event) => offers.push(event));
+    guest.on("webrtc:answer", (event) => answers.push(event));
+    const offerReceived = waitFor(host, "webrtc:offer");
+    const offerAck = await emit(guest, "webrtc:offer", {
+      roomId: created.roomId,
+      to: host.id,
+      sdp: "v=0\nprivate-offer",
+    });
+    expect(offerAck.ok).toBe(true);
+    expect(await offerReceived).toMatchObject({ from: guest.id, roomId: created.roomId });
+
+    const answerReceived = waitFor(guest, "webrtc:answer");
+    const answerAck = await emit(host, "webrtc:answer", {
+      roomId: created.roomId,
+      to: guest.id,
+      sdp: "v=0\nprivate-answer",
+    });
+    expect(answerAck.ok).toBe(true);
+    expect(await answerReceived).toMatchObject({ from: host.id, roomId: created.roomId });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(offers).toHaveLength(1);
+    expect(answers).toHaveLength(1);
+
     host.disconnect();
     guest.disconnect();
+  });
+
+  it("does not restore room authorization on a replacement socket after reconnect", async () => {
+    const host = await connectClient();
+    await emit(host, "username:set", { username: "hostrejoin" });
+    const created = await emit(host, "room:create");
+    await emit(host, "room:join", { roomId: created.roomId, isHost: true });
+
+    const guest = await connectClient();
+    await emit(guest, "username:set", { username: "guestrejoin" });
+    const request = await emit(guest, "room:request-join", { code: created.code });
+    await emit(host, "room:accept", { roomId: created.roomId, requestId: request.requestId });
+    await emit(guest, "room:join", { roomId: created.roomId, isHost: false });
+    const oldSocketId = guest.id;
+    guest.disconnect();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const replacement = await connectClient();
+    await emit(replacement, "username:set", { username: "guestrejoin2" });
+    expect(replacement.id).not.toBe(oldSocketId);
+    const rejected = await emit(replacement, "webrtc:answer", {
+      roomId: created.roomId,
+      to: host.id,
+      sdp: "v=0\nstale-socket",
+    });
+    expect(rejected).toMatchObject({ ok: false, error: "not-in-room" });
+
+    host.disconnect();
+    replacement.disconnect();
+  });
+
+  it("rechecks membership when a room is cleaned up during asynchronous signaling", async () => {
+    const host = await connectClient();
+    await emit(host, "username:set", { username: "hostrace" });
+    const created = await emit(host, "room:create");
+    await emit(host, "room:join", { roomId: created.roomId, isHost: true });
+
+    const guest = await connectClient();
+    await emit(guest, "username:set", { username: "guestrace" });
+    const request = await emit(guest, "room:request-join", { code: created.code });
+    await emit(host, "room:accept", { roomId: created.roomId, requestId: request.requestId });
+    await emit(guest, "room:join", { roomId: created.roomId, isHost: false });
+
+    const originalIn = io.in.bind(io);
+    let releaseFetch;
+    let fetchStarted;
+    const started = new Promise((resolve) => { fetchStarted = resolve; });
+    const paused = new Promise((resolve) => { releaseFetch = resolve; });
+    io.in = (id) => {
+      const target = originalIn(id);
+      if (id !== guest.id) return target;
+      return {
+        fetchSockets: async () => {
+          fetchStarted();
+          await paused;
+          return target.fetchSockets();
+        },
+      };
+    };
+
+    try {
+      const signalPromise = emit(host, "webrtc:offer", {
+        roomId: created.roomId,
+        to: guest.id,
+        sdp: "v=0\nrace-offer",
+      });
+      await started;
+      const leaveAck = await emit(host, "room:leave");
+      expect(leaveAck.ok).toBe(true);
+      releaseFetch();
+      expect(await signalPromise).toMatchObject({ ok: false, error: "not-in-room" });
+    } finally {
+      releaseFetch();
+      io.in = originalIn;
+      host.disconnect();
+      guest.disconnect();
+    }
   });
 
   it("only the host can accept (non-host gets not-host)", async () => {

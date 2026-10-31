@@ -26,6 +26,7 @@ export class RoomRT {
     this.closed = false;
     this.timer = null;
     this.socket = null;
+    this.hasConnected = false;
     queueMicrotask(() => this._connect());
   }
 
@@ -61,7 +62,14 @@ this.socket = socket;
       if (ev.endsWith(":ok")) return;
       if (this.onEvent) this.onEvent(ev, data);
     });
-    socket.on("connect", () => { this.retries = 0; this.setStatus("live"); });
+    socket.on("connect", () => {
+      if (this.hasConnected && import.meta.env.DEV) {
+        console.debug("Private-room Socket.IO reconnected", { socketId: socket.id });
+      }
+      this.hasConnected = true;
+      this.retries = 0;
+      this.setStatus("live");
+    });
     socket.on("connect_error", (e) => {
       console.warn("room socket connect_error:", e && e.message);
       socket.close();

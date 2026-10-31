@@ -12,6 +12,9 @@ function fakeIo() {
   return {
     sockets: { sockets: socketsMap },
     out,
+    in(id) {
+      return { fetchSockets: async () => (socketsMap.has(id) ? [{ id }] : []) };
+    },
     add(id) {
       if (!socketsMap.has(id)) {
         socketsMap.set(id, {});
@@ -58,6 +61,36 @@ describe("matchmaking engine", () => {
     expect(await store.queueLength("video")).toBe(0);
     expect(await store.matchGet(fa.matchId)).toMatchObject({ a: "a", b: "b", mode: "video" });
     mm.close();
+  });
+
+  it("matches across backend instances and carries match generations", async () => {
+    const store = new MemoryStore();
+    const io = fakeIo();
+    const first = createMatchmaker({ store, io, log: LOG, cfg: CFG });
+    const second = createMatchmaker({ store, io, log: LOG, cfg: CFG });
+    io.add("a");
+    io.add("b");
+
+    await first.find("a", "video", undefined, "generation-a");
+    const result = await second.find("b", "video", undefined, "generation-b");
+    expect(result.matched).toBeTruthy();
+    const matchId = result.matched;
+    expect(io.out.get("a")).toContainEqual([
+      "match:found",
+      expect.objectContaining({ matchId, generation: "generation-a" }),
+    ]);
+    expect(io.out.get("b")).toContainEqual([
+      "match:found",
+      expect.objectContaining({ matchId, generation: "generation-b" }),
+    ]);
+    expect(await store.matchForSocket("a")).toBe(matchId);
+
+    await second.next("b", matchId);
+    expect(await store.matchForSocket("a")).toBeNull();
+    expect((await first.find("a", "video", undefined, "generation-a2")).queued).toBe(true);
+
+    first.close();
+    second.close();
   });
 
   it("queues multiple simultaneous entrants and pairs them FIFO as new users arrive", async () => {

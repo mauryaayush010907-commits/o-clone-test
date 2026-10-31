@@ -323,12 +323,11 @@ export function createRoomManager({ store, io, log, cfg }) {
       const stream = store.redis.scanStream({ match: "room:*:members", count: 200 });
       for await (const keys of stream) {
         for (const key of keys) {
-          const id = key.split(":")[1].replace(/:members$/, "");
-          // Skip the by-hash keys.
-          if (id.startsWith("by-hash")) continue;
-          const m = await store.roomGetMembers("r_" + id);
+          const id = key.slice("room:".length, -":members".length);
+          if (!id || id.startsWith("by-hash")) continue;
+          const m = await store.roomGetMembers(id);
           if (m && m.members.has(socketId)) {
-            foundRoom = { id: "r_" + id, m };
+            foundRoom = { id, m };
             break;
           }
         }
@@ -391,10 +390,10 @@ export function createRoomManager({ store, io, log, cfg }) {
       const stream = store.redis.scanStream({ match: "room:*:members", count: 100 });
       for await (const keys of stream) {
         for (const key of keys) {
-          const id = key.split(":")[1].replace(/:members$/, "");
-          if (id.startsWith("by-hash")) continue;
-          const m = await store.roomGetMembers("r_" + id);
-          if (m && m.members.has(socketId)) return { roomId: "r_" + id, members: m };
+          const id = key.slice("room:".length, -":members".length);
+          if (!id || id.startsWith("by-hash")) continue;
+          const m = await store.roomGetMembers(id);
+          if (m && m.members.has(socketId)) return { roomId: id, members: m };
         }
       }
       return null;

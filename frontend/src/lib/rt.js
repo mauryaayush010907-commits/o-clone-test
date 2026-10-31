@@ -20,6 +20,7 @@ export class SocketRT {
     this.closed = false;
     this.timer = null;
     this.socket = null;
+    this.hasConnected = false;
     this._connect();
   }
 
@@ -58,6 +59,10 @@ this.socket = socket;
       if (this.onEvent) this.onEvent(ev, data);
     });
     socket.on("connect", () => {
+      if (this.hasConnected && import.meta.env.DEV) {
+        console.debug("Socket.IO reconnected", { socketId: socket.id });
+      }
+      this.hasConnected = true;
       this.retries = 0;
       this.setStatus("live");
     });

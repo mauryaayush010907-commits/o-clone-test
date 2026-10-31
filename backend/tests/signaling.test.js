@@ -443,6 +443,49 @@ describe("real-time signaling over real sockets", () => {
     b.disconnect();
   });
 
+  it("rejects stale offers and answers after a match ends", async () => {
+    const a = await connectClient();
+    const b = await connectClient();
+    const aQueued = waitFor(a, "match:queued");
+    await emit(a, "match:find", { mode: "video", generation: "session-a1" });
+    await aQueued;
+    const aFoundP = waitFor(a, "match:found");
+    const bFoundP = waitFor(b, "match:found");
+    await emit(b, "match:find", { mode: "video", generation: "session-b1" });
+    const [{ matchId }] = await Promise.all([aFoundP, bFoundP]);
+
+    await emit(a, "match:next", { matchId });
+    const staleAnswer = await emit(b, "webrtc:answer", {
+      matchId,
+      sdp: "v=0\nstale-answer",
+      attempt: 0,
+    });
+    expect(staleAnswer).toMatchObject({ ok: false, code: "no-match" });
+    const staleOffer = await emit(a, "webrtc:offer", {
+      matchId,
+      sdp: "v=0\nstale-offer",
+      attempt: 0,
+    });
+    expect(staleOffer).toMatchObject({ ok: false, code: "no-match" });
+
+    const nextAFoundP = waitFor(a, "match:found");
+    const nextBFoundP = waitFor(b, "match:found");
+    await emit(a, "match:find", { mode: "video", generation: "session-a2" });
+    await emit(b, "match:find", { mode: "video", generation: "session-b2" });
+    const [nextAFound, nextBFound] = await Promise.all([nextAFoundP, nextBFoundP]);
+    expect(nextAFound.matchId).toBe(nextBFound.matchId);
+    await emit(a, "match:stop", { matchId: nextAFound.matchId });
+    const stoppedAnswer = await emit(b, "webrtc:answer", {
+      matchId: nextAFound.matchId,
+      sdp: "v=0\nanswer-after-stop",
+      attempt: 0,
+    });
+    expect(stoppedAnswer).toMatchObject({ ok: false, code: "no-match" });
+
+    a.disconnect();
+    b.disconnect();
+  });
+
   it("disconnecting one side notifies the other with reason 'disconnected'", async () => {
     const a = await connectClient();
     const b = await connectClient();

@@ -1,0 +1,385 @@
+@import "tailwindcss";
+
+/*
+ * Theme system: light is the default token set; the `.dark` class on <html>
+ * overrides the same custom properties. All utilities reference the variables,
+ * so the whole UI re-themes at runtime with zero markup changes.
+ */
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+
+  /* light */
+  --color-ink: #f2f5f8;
+  --color-panel: #ffffff;
+  --color-panel2: #eceff4;
+  --color-line: #dbe2ea;
+  --color-line2: #c3cdd8;
+  --color-fog: #1a2532;
+  --color-mute: #5b6b7d;
+  --color-dim: #8291a3;
+  --color-ember: #e64f22;
+  --color-ember2: #f5814e;
+  --color-aqua: #0e9f7e;
+  --color-danger: #d62f52;
+  --color-warn: #a3620a;
+  --color-ghost: #1a243014;
+  --color-accent: #0b1017; /* constant: text on ember accents */
+}
+
+.dark {
+  --color-ink: #070b10;
+  --color-panel: #0e141c;
+  --color-panel2: #131c26;
+  --color-line: #1f2c3a;
+  --color-line2: #2a3a4c;
+  --color-fog: #e8eef5;
+  --color-mute: #8fa0b2;
+  --color-dim: #5c6c7e;
+  --color-ember: #ff6a3d;
+  --color-ember2: #ffa26b;
+  --color-aqua: #3bd8b4;
+  --color-danger: #ff5470;
+  --color-warn: #ffc24b;
+  --color-ghost: #ffffff14;
+  --color-accent: #0b1017;
+}
+
+:root {
+  color-scheme: light;
+}
+.dark {
+  color-scheme: dark;
+}
+
+html {
+  scrollbar-color: var(--color-line2) var(--color-ink);
+}
+
+body {
+  min-height: 100dvh;
+  overflow-x: hidden;
+}
+
+::selection {
+  background: rgba(230, 79, 34, 0.28);
+}
+
+/* ---------- keyframes ---------- */
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.1);
+    opacity: 0;
+  }
+}
+@keyframes drift-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes blink {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+@keyframes typingPulse {
+  0%,
+  80%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+@keyframes shimmer {
+  from {
+    background-position: -200% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+
+.anim-fade-up {
+  animation: fade-up 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.anim-fade-in {
+  animation: fade-in 0.4s ease both;
+}
+.anim-msg {
+  animation: msg-in 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.anim-spin-slow {
+  animation: drift-spin 1.1s linear infinite;
+}
+.typing-dot {
+  animation: blink 1.2s infinite both;
+}
+.typing-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.typing-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+.pulse-ring::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  border: 2px solid var(--color-ember);
+  animation: pulse-ring 1.6s ease-out infinite;
+}
+
+.hero-glow {
+  background:
+    radial-gradient(560px 300px at 18% -6%, rgba(230, 79, 34, 0.12), transparent 60%),
+    radial-gradient(620px 340px at 85% 4%, rgba(14, 159, 126, 0.08), transparent 60%);
+}
+.dark .hero-glow {
+  background:
+    radial-gradient(560px 300px at 18% -6%, rgba(255, 106, 61, 0.16), transparent 60%),
+    radial-gradient(620px 340px at 85% 4%, rgba(59, 216, 180, 0.09), transparent 60%);
+}
+
+.shimmer-bar {
+  background: linear-gradient(
+    100deg,
+    var(--color-ghost) 40%,
+    var(--color-line2) 50%,
+    var(--color-ghost) 60%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+
+/* thin scrollbars for chat */
+.nice-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.nice-scroll::-webkit-scrollbar-thumb {
+  background: var(--color-line2);
+  border-radius: 8px;
+}
+.nice-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ============================================================
+   Chat section — WhatsApp / Telegram-style background + bubbles
+   ============================================================ */
+
+/* Composer footer that sits on the chat surface. */
+.chat-composer {
+  background: var(--chat-bg);
+  border-top: 1px solid var(--chat-divider);
+  /* the input bubble inside the composer uses the incoming bubble tone
+     with a soft shadow, like WhatsApp / Telegram */
+}
+.chat-composer textarea {
+  background: var(--chat-bubble-in);
+  color: var(--chat-bubble-in-fg);
+  border: none;
+  box-shadow: 0 1px 0.5px rgba(0, 0, 0, 0.1);
+}
+.chat-composer textarea::placeholder {
+  color: var(--chat-bubble-in-meta);
+}
+.chat-composer textarea:focus {
+  outline: 1px solid var(--chat-divider);
+  box-shadow: 0 1px 1px rgba(0, 0, 0, 0.15);
+}
+
+/* Per-theme chat tokens. The pattern is rendered with CSS gradients so the
+   file stays self-contained (no external image). */
+:root {
+  --chat-bg: #e5ddd5;            /* warm off-white, like WhatsApp light */
+  --chat-bg-tint: #efeae3;
+  --chat-pattern: rgba(0, 0, 0, 0.045);
+  --chat-bubble-in: #ffffff;
+  --chat-bubble-out: #d9fdd3;
+  --chat-bubble-in-fg: #0b1017;
+  --chat-bubble-out-fg: #0b1017;
+  --chat-bubble-in-meta: #5c6c7e;
+  --chat-bubble-out-meta: #4a6a55;
+  --chat-divider: #c3c0b9;
+  --chat-scroll: #b3ada4;
+}
+.dark {
+  --chat-bg: #0d1418;            /* dark teal-tinted, like WhatsApp dark */
+  --chat-bg-tint: #101a20;
+  --chat-pattern: rgba(255, 255, 255, 0.035);
+  --chat-bubble-in: #1c2a33;
+  --chat-bubble-out: #005c4b;    /* signature dark-mode teal */
+  --chat-bubble-in-fg: #e8eef5;
+  --chat-bubble-out-fg: #e8eef5;
+  --chat-bubble-in-meta: #8fa0b2;
+  --chat-bubble-out-meta: #b8d9cf;
+  --chat-divider: #1f2c3a;
+  --chat-scroll: #2a3a4c;
+}
+
+/* The page area behind the chat list. A soft diagonal pattern in two
+   layers, plus a subtle radial highlight at the top, gives the warm
+   paper / dark-teal feel of WhatsApp / Telegram without external assets. */
+.chat-surface {
+  background-color: var(--chat-bg);
+  background-image:
+    /* tiny chat-bubble pattern: 1 solid circle + 1 outlined circle, repeated */
+    radial-gradient(circle at 16px 16px, var(--chat-pattern) 0 1.5px, transparent 2.5px),
+    radial-gradient(circle at 16px 16px, var(--chat-pattern) 1.4px 1.4px, transparent 2.6px),
+    /* subtle warm/cool tint */
+    radial-gradient(900px 480px at 50% -10%, var(--chat-bg-tint), transparent 70%),
+    /* faint diagonal weave */
+    repeating-linear-gradient(45deg, var(--chat-pattern) 0 1px, transparent 1px 14px);
+  background-size: 32px 32px, 32px 32px, auto, auto;
+  background-position: 0 0, 16px 16px, 0 0, 0 0;
+}
+
+.chat-divider {
+  background: var(--chat-divider);
+}
+
+/* Color-scheme aware scrollbar inside the chat surface. */
+.chat-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.chat-scroll::-webkit-scrollbar-thumb {
+  background: var(--chat-scroll);
+  border-radius: 8px;
+}
+.chat-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Day separator pill (e.g. "Today", "Yesterday"). */
+.chat-day-sep {
+  display: flex;
+  justify-content: center;
+  margin: 0.5rem 0;
+}
+.chat-day-sep > span {
+  background: rgba(0, 0, 0, 0.08);
+  color: var(--chat-bubble-in-fg);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  letter-spacing: 0.01em;
+}
+.dark .chat-day-sep > span {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--chat-bubble-in-fg);
+}
+
+/* Per-bubble styles used by the new ChatPanel. Defined as classes so we
+   can reuse the same markup in two themes without duplicating components. */
+.bubble {
+  position: relative;
+  max-width: 78%;
+  padding: 0.4rem 0.6rem 0.3rem;
+  border-radius: 14px;
+  font-size: 0.9rem;
+  line-height: 1.35;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  box-shadow: 0 1px 0.5px rgba(0, 0, 0, 0.07);
+  color: var(--chat-bubble-in-fg);
+  background: var(--chat-bubble-in);
+  border-top-left-radius: 4px;
+  margin: 0.1rem 0;
+}
+.bubble-mine {
+  background: var(--chat-bubble-out);
+  color: var(--chat-bubble-out-fg);
+  border-top-right-radius: 4px;
+  border-top-left-radius: 14px;
+  margin-left: auto;
+}
+.dark .bubble {
+  box-shadow: 0 1px 0.5px rgba(0, 0, 0, 0.5);
+}
+.bubble-row-mine {
+  display: flex;
+  justify-content: flex-end;
+}
+.bubble-row {
+  display: flex;
+}
+.bubble-meta {
+  float: right;
+  margin-left: 0.5rem;
+  margin-top: 0.2rem;
+  font-size: 10px;
+  color: var(--chat-bubble-in-meta);
+}
+.bubble-mine .bubble-meta {
+  color: var(--chat-bubble-out-meta);
+}
+
+/* small caret notch on the leading edge of incoming bubbles (WhatsApp-style) */
+.bubble::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -7px;
+  width: 12px;
+  height: 12px;
+  background: var(--chat-bubble-in);
+  clip-path: path("M12 0 L0 0 A12 12 0 0 0 12 12 Z");
+}
+.bubble-mine::before {
+  left: auto;
+  right: -7px;
+  background: var(--chat-bubble-out);
+  clip-path: path("M0 0 L12 0 A12 12 0 0 1 0 12 Z");
+}
+
+/* animated tail-wag (very subtle) on hover; disabled in reduced-motion */
+@media (prefers-reduced-motion: no-preference) {
+  .bubble:hover::before {
+    transform: translateX(1px);
+    transition: transform 0.18s ease;
+  }
+}
